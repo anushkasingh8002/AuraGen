@@ -1,3 +1,4 @@
+
 // server/index.js
 // ─────────────────────────────────────────────────────────────────────
 // Entry point: Express HTTP server + WebSocket layer.
@@ -21,8 +22,11 @@ import { WebSocketServer } from "ws";
 
 import config from "./config.js";
 import log from "./safety/logger.js";
+import { send } from "./ws/send.js";
 import { createWindow } from "./friction/sessionWindow.js";
 import { computeCLS } from "./friction/score.js";
+import { createTrigger } from "./friction/trigger.js";
+import { resolveSnapshot } from "./agent/snapshot.js";
 
 // ── constants ────────────────────────────────────────────────────────
 
@@ -57,14 +61,7 @@ const wss = new WebSocketServer({
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-/**
- * Send a typed JSON envelope to a session.
- * No-ops if the socket is no longer open (avoids "not opened" throws).
- */
-export function send(session, type, payload = {}) {
-  if (session.socket.readyState !== session.socket.OPEN) return;
-  session.socket.send(JSON.stringify({ type, sessionId: session.id, payload }));
-}
+export { send };
 
 // ── message handlers ─────────────────────────────────────────────────
 // Each key is a message `type`; the value is an async function receiving
@@ -79,6 +76,13 @@ handlers["session:start"] = async (session, payload) => {
 
   // Initialise the telemetry sliding window for this session.
   session.window = createWindow();
+
+  // Initialise the redesign trigger for this session.
+  session.trigger = createTrigger({
+    threshold: config.CLS_THRESHOLD,
+    sustainMs: config.CLS_SUSTAIN_MS,
+    cooldownMs: config.REDESIGN_COOLDOWN_MS,
+  });
 
   log.info("session:start", { sessionId: session.id, formId: session.formId });
 
@@ -124,12 +128,72 @@ handlers["telemetry:batch"] = async (session, payload) => {
     hotField: metrics.hotField,
   });
 
-  // TODO [Step 3] – pass score to the sustained-threshold trigger
+  // ── trigger check ──────────────────────────────────────────────────
+  // Lazily create the trigger if session:start was missed.
+  if (!session.trigger) {
+    session.trigger = createTrigger({
+      threshold: config.CLS_THRESHOLD,
+      sustainMs: config.CLS_SUSTAIN_MS,
+      cooldownMs: config.REDESIGN_COOLDOWN_MS,
+    });
+  }
+
+  const { fire, friction } = session.trigger.update(
+    score,
+    metrics.hotField,
+    now,
+  );
+
+  if (fire) {
+    log.info("redesign_triggered", {
+      sessionId: session.id,
+      score: friction.score,
+      field: friction.field,
+    });
+
+    // TODO [Step 8] – replace this placeholder with the real pipeline
+    startRedesign(session, friction);
+  }
 };
 
-// TODO [Step 5] – handlers["snapshot:request"] → DOM snapshot receiver
+// ── DOM snapshot response from browser ───────────────────────────────
+
+handlers["snapshot:response"] = async (session, payload) => {
+  if (!payload || typeof payload.requestId !== "string") {
+    log.warn("snapshot:invalid_payload", { sessionId: session.id });
+    return;
+  }
+
+  log.info("snapshot:response", {
+    sessionId: session.id,
+    requestId: payload.requestId,
+  });
+
+  resolveSnapshot(payload.requestId, payload);
+};
+
 // TODO [Step 7] – handlers["render:result"]    → browser render feedback
 // TODO [Step 7] – handlers["wizard:submit"]    → wizard submission data
+
+// ── redesign placeholder ─────────────────────────────────────────────
+// Step 8 will replace this with the full pipeline:
+//   snapshot → LLM → AST validate → compile → cache → send.
+
+/**
+ * Placeholder — called when the trigger fires.
+ * @param {object} session  – the active session
+ * @param {{ field: string|null, score: number }} friction – trigger context
+ */
+function startRedesign(session, friction) {
+  log.info("redesign:placeholder", {
+    sessionId: session.id,
+    score: friction.score,
+    field: friction.field,
+    note: "pipeline not wired yet",
+  });
+
+  // TODO [Step 8] – call the real redesign pipeline here
+}
 
 // ── connection lifecycle ─────────────────────────────────────────────
 
@@ -152,8 +216,8 @@ wss.on("connection", (socket, req) => {
     formId: null,
     createdAt: Date.now(),
     lastSeen: Date.now(),
-    window: null, // TODO [Step 2] – sliding telemetry window
-    trigger: null, // TODO [Step 3] – sustained-threshold trigger
+    window: null,  // initialised in session:start handler
+    trigger: null, // initialised in session:start handler
     lastRedesignAt: 0,
   };
 
@@ -242,9 +306,11 @@ wss.on("close", () => clearInterval(heartbeat));
 
 // ── start listening ──────────────────────────────────────────────────
 
-server.listen(config.PORT, () => {
-  log.info("server:start", { port: config.PORT });
-});
+if (process.env.NODE_ENV !== "test") {
+  server.listen(config.PORT, () => {
+    log.info("server:start", { port: config.PORT });
+  });
+}
 
 // ── graceful shutdown ────────────────────────────────────────────────
 
