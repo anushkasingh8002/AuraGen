@@ -71,7 +71,17 @@ export function useFormState() {
   const prevStep = useCallback(() => setCurrentStep((s) => Math.max(s - 1, 1)), [])
   const goToStep = useCallback((step: number) => setCurrentStep(step), [])
 
-  return { formData, errors, currentStep, updateField, updateTopLevel, nextStep, prevStep, goToStep }
+  return {
+    formData,
+    setFormData,
+    errors,
+    currentStep,
+    updateField,
+    updateTopLevel,
+    nextStep,
+    prevStep,
+    goToStep,
+  }
 }
 
 export type FormStateReturn = ReturnType<typeof useFormState>

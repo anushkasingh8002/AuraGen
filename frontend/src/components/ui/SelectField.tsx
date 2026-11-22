@@ -4,6 +4,7 @@ import clsx from 'clsx'
 interface SelectFieldProps extends SelectHTMLAttributes<HTMLSelectElement> {
   label: string
   error?: string
+  hint?: string
   options: { value: string; label: string }[]
   placeholder?: string
 }
@@ -11,6 +12,7 @@ interface SelectFieldProps extends SelectHTMLAttributes<HTMLSelectElement> {
 export default function SelectField({
   label,
   error,
+  hint,
   options,
   placeholder,
   className,
@@ -37,6 +39,7 @@ export default function SelectField({
           </option>
         ))}
       </select>
+      {hint && !error && <p className="text-xs text-slate-400 mt-1">{hint}</p>}
       {error && <p className="error-text">{error}</p>}
     </div>
   )
