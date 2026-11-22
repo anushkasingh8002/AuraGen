@@ -27,6 +27,7 @@ import { createWindow } from "./friction/sessionWindow.js";
 import { computeCLS } from "./friction/score.js";
 import { createTrigger } from "./friction/trigger.js";
 import { resolveSnapshot } from "./agent/snapshot.js";
+import { startRedesign, evictComponent } from "./pipeline/redesign.js";
 
 // ── constants ────────────────────────────────────────────────────────
 
@@ -151,8 +152,13 @@ handlers["telemetry:batch"] = async (session, payload) => {
       field: friction.field,
     });
 
-    // TODO [Step 8] – replace this placeholder with the real pipeline
-    startRedesign(session, friction);
+    // Execute redesign pipeline asynchronously
+    startRedesign(session, friction).catch((err) => {
+      log.error("redesign:uncaught_error", {
+        sessionId: session.id,
+        error: err.message,
+      });
+    });
   }
 };
 
@@ -172,28 +178,37 @@ handlers["snapshot:response"] = async (session, payload) => {
   resolveSnapshot(payload.requestId, payload);
 };
 
-// TODO [Step 7] – handlers["render:result"]    → browser render feedback
-// TODO [Step 7] – handlers["wizard:submit"]    → wizard submission data
+// ── browser component render feedback ────────────────────────────────
 
-// ── redesign placeholder ─────────────────────────────────────────────
-// Step 8 will replace this with the full pipeline:
-//   snapshot → LLM → AST validate → compile → cache → send.
+handlers["render:result"] = async (session, payload) => {
+  if (payload?.ok === false) {
+    log.warn("render:failed", {
+      sessionId: session.id,
+      componentId: payload.componentId,
+      error: payload.error,
+    });
+    // Evict faulty component from cache so other sessions don't receive it
+    evictComponent(payload.componentId);
+  } else {
+    log.info("render:ok", {
+      sessionId: session.id,
+      componentId: payload?.componentId,
+    });
+  }
+};
 
-/**
- * Placeholder — called when the trigger fires.
- * @param {object} session  – the active session
- * @param {{ field: string|null, score: number }} friction – trigger context
- */
-function startRedesign(session, friction) {
-  log.info("redesign:placeholder", {
+// ── wizard form submission ───────────────────────────────────────────
+
+handlers["wizard:submit"] = async (session, payload) => {
+  // CRITICAL PRIVACY RULE: Never log form field values (only session and field count)
+  log.info("wizard:submit", {
     sessionId: session.id,
-    score: friction.score,
-    field: friction.field,
-    note: "pipeline not wired yet",
+    ok: true,
+    fieldCount: payload ? Object.keys(payload).length : 0,
   });
 
-  // TODO [Step 8] – call the real redesign pipeline here
-}
+  send(session, "submit:ack", { ok: true });
+};
 
 // ── connection lifecycle ─────────────────────────────────────────────
 

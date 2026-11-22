@@ -39,3 +39,33 @@ export class CodeGenError extends Error {
     this.details = details;
   }
 }
+
+/**
+ * Thrown when generated code fails AST validation after retry.
+ */
+export class ValidationError extends Error {
+  /**
+   * @param {string} message
+   * @param {string[]} [errors]
+   */
+  constructor(message, errors = []) {
+    super(message);
+    this.name = "ValidationError";
+    this.errors = errors;
+  }
+}
+
+/**
+ * Thrown when Babel compilation of a validated AST fails.
+ */
+export class CompileError extends Error {
+  /**
+   * @param {string} message
+   * @param {string[]} [errors]
+   */
+  constructor(message, errors = []) {
+    super(message);
+    this.name = "CompileError";
+    this.errors = errors;
+  }
+}

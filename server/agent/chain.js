@@ -15,6 +15,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { ChatOpenAI } from "@langchain/openai";
 import { SystemMessage, HumanMessage } from "@langchain/core/messages";
@@ -37,6 +38,17 @@ const designSystemText = fs.readFileSync(
 );
 
 const FULL_SYSTEM_PROMPT = `${systemPromptText}\n\n${designSystemText}`;
+
+/**
+ * Deterministic hash of the system and design system prompts.
+ * Changes automatically whenever prompts are modified to prevent
+ * serving stale components from the cache.
+ */
+export const PROMPT_VERSION = crypto
+  .createHash("sha256")
+  .update(FULL_SYSTEM_PROMPT, "utf8")
+  .digest("hex")
+  .slice(0, 16);
 
 /**
  * Strips markdown code fences (```jsx, ```javascript, ```) and trims.
