@@ -506,3 +506,86 @@ describe("Mock component", () => {
     expect(result.ok).toBe(true);
   });
 });
+
+// =====================================================================
+//  14. Security bypass regression suite (Step 12)
+// =====================================================================
+
+describe("Security bypass resistance (allow-list enforcement)", () => {
+  const bypassCases = [
+    [
+      "computed concat constructor",
+      'import React from "react"; export default function W({ initialValues }) { return <div>{(() => {})["con" + "structor"]("alert(1)")()}</div>; }',
+    ],
+    [
+      "template literal computed constructor",
+      'import React from "react"; export default function W({ initialValues }) { return <div>{(() => {})[`constructor`]("alert(1)")()}</div>; }',
+    ],
+    [
+      "destructured constructor escape",
+      'import React from "react"; export default function W({ initialValues }) { const { constructor: F } = (() => {}); return <div>{F("alert(1)")()}</div>; }',
+    ],
+    [
+      "Object.getPrototypeOf async constructor escape",
+      'import React from "react"; export default function W({ initialValues }) { const { constructor: AF } = Object.getPrototypeOf(async () => {}); return <div>{AF("alert(1)")()}</div>; }',
+    ],
+    [
+      "JSX spread hiding dangerouslySetInnerHTML",
+      'import React from "react"; export default function W({ initialValues }) { const p = { dangerouslySetInnerHTML: { __html: "<img src=x onerror=alert(1)>" } }; return <div {...p} />; }',
+    ],
+    [
+      "JSX spread hiding inline event handler",
+      'import React from "react"; export default function W({ initialValues }) { const p = { onClick: "alert(1)" }; return <button {...p}>Hi</button>; }',
+    ],
+    [
+      "dynamic JSX tag rendering script",
+      'import React from "react"; export default function W({ initialValues }) { const Tag = "script"; return <Tag>alert(1)</Tag>; }',
+    ],
+    [
+      "split template literal javascript: URL",
+      'import React from "react"; export default function W({ initialValues }) { const u = `java${""}script:alert(1)`; return <a href={u}>click</a>; }',
+    ],
+    [
+      "hex-escaped template literal javascript: URL",
+      'import React from "react"; export default function W({ initialValues }) { const u = `\\x6aavascript:alert(1)`; return <a href={u}>click</a>; }',
+    ],
+    [
+      "variable concatenation javascript: URL",
+      'import React from "react"; export default function W({ initialValues }) { const a = "java"; const b = "script:alert(1)"; return <a href={a + b}>click</a>; }',
+    ],
+    [
+      "getter trap inside object literal",
+      'import React from "react"; export default function W({ initialValues }) { const o = { get dangerouslySetInnerHTML() { return { __html: "<svg onload=alert(1)>" }; } }; return <div {...o} />; }',
+    ],
+    [
+      "unblocked global / alert / location / navigator",
+      'import React from "react"; export default function W({ initialValues }) { location.href = "https://evil.com"; alert(1); return <div />; }',
+    ],
+    [
+      "Object.getOwnPropertyDescriptor sandbox escape",
+      'import React from "react"; export default function W({ initialValues }) { const x = Object.getOwnPropertyDescriptor(Object.getPrototypeOf({}), "constructor").value; return <div>{x("alert(1)")()}</div>; }',
+    ],
+    [
+      "React namespace import introspection",
+      'import * as R from "react"; export default function W({ initialValues }) { return <div>{Object.keys(R).join(",")}</div>; }',
+    ],
+    [
+      "shadowed forbidden global parameter",
+      'import React from "react"; export default function W({ initialValues, fetch }) { return <div>{fetch ? fetch("/evil") : null}</div>; }',
+    ],
+    [
+      "unrecognized DOM global (webkitRequestFileSystem)",
+      'import React from "react"; export default function W({ initialValues }) { return <div>{webkitRequestFileSystem()}</div>; }',
+    ],
+    [
+      "this expression leak",
+      'import React from "react"; export default function W({ initialValues }) { return <div>{String(this)}</div>; }',
+    ],
+  ];
+
+  test.each(bypassCases)("rejects %s", (_label, code) => {
+    const result = validate(code);
+    expect(result.ok).toBe(false);
+    expect(result.errors.length).toBeGreaterThan(0);
+  });
+});

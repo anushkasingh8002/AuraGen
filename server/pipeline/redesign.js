@@ -1,16 +1,6 @@
 // server/pipeline/redesign.js
 // ─────────────────────────────────────────────────────────────────────
-// Redesign pipeline and delivery orchestrator.
-//
-// RESPONSIBILITIES
-//   1. Guard against concurrent redesign runs per session.
-//   2. Request DOM snapshot from the browser and mask sensitive fields.
-//   3. Compute cache key and query the LRU cache (with single-flight protection).
-//   4. If cache miss: generate React wizard code via LLM, validate AST,
-//      retry once with feedback if validation fails, and compile to CommonJS.
-//   5. Record microsecond timing marks across all stages.
-//   6. Deliver the compiled component to the browser via redesign:ready.
-//   7. Track componentId-to-cacheKey mapping to evict bad components on render error.
+// Redesign pipeline, speculative pre-warming, safety guards, & delivery.
 // ─────────────────────────────────────────────────────────────────────
 
 import { performance } from "node:perf_hooks";
@@ -31,20 +21,45 @@ import {
   makeKey as defaultMakeKey,
   schemaHash as defaultSchemaHash,
 } from "../cache/cache.js";
-import { ValidationError, CompileError } from "../safety/errors.js";
+import { llmBreaker as defaultBreaker } from "../safety/breaker.js";
+import {
+  sessionRedesignLimiter as defaultSessionLimiter,
+  globalLlmLimiter as defaultGlobalLimiter,
+} from "../safety/rateLimit.js";
+import { ValidationError, CompileError, toReason } from "../safety/errors.js";
 
-/** Map tracking componentId (SHA-256 hash) -> cacheKey for render error eviction */
+const MAX_KEY_MAP_ENTRIES = 200;
+
+/** Bounded map tracking componentId (SHA-256 hash) -> cacheKey for eviction */
 const componentToKeyMap = new Map();
+
+function trackComponentKey(componentId, key) {
+  if (componentToKeyMap.has(componentId)) {
+    componentToKeyMap.delete(componentId);
+  } else if (componentToKeyMap.size >= MAX_KEY_MAP_ENTRIES) {
+    const oldest = componentToKeyMap.keys().next().value;
+    if (oldest !== undefined) componentToKeyMap.delete(oldest);
+  }
+  componentToKeyMap.set(componentId, key);
+}
 
 /**
  * Evict a component from cache by its componentId (hash).
- * Called when browser reports render:result with ok: false.
+ * When `session` is provided, requires that the session actually received
+ * that componentId to prevent unauthenticated cross-session cache busting.
  *
  * @param {string} componentId
  * @param {object} [cacheInstance]
+ * @param {object} [session]
  * @returns {boolean} whether an entry was evicted
  */
-export function evictComponent(componentId, cacheInstance = defaultCache) {
+export function evictComponent(componentId, cacheInstance = defaultCache, session = null) {
+  if (!componentId || typeof componentId !== "string") return false;
+
+  if (session?.deliveredComponents instanceof Set && !session.deliveredComponents.has(componentId)) {
+    return false;
+  }
+
   const key = componentToKeyMap.get(componentId);
   if (key) {
     componentToKeyMap.delete(componentId);
@@ -58,28 +73,280 @@ export function evictComponent(componentId, cacheInstance = defaultCache) {
   return false;
 }
 
+function resolveDeps(deps = {}) {
+  return {
+    log: deps.log ?? defaultLog,
+    config: deps.config ?? defaultConfig,
+    send: deps.send ?? defaultSend,
+    requestSnapshot: deps.requestSnapshot ?? defaultRequestSnapshot,
+    maskValues: deps.maskValues ?? defaultMaskValues,
+    generate: deps.generate ?? defaultGenerate,
+    PROMPT_VERSION: deps.PROMPT_VERSION ?? DEFAULT_PROMPT_VERSION,
+    validate: deps.validate ?? defaultValidate,
+    compile: deps.compile ?? defaultCompile,
+    cache: deps.cache ?? defaultCache,
+    makeKey: deps.makeKey ?? defaultMakeKey,
+    schemaHash: deps.schemaHash ?? defaultSchemaHash,
+    breaker: deps.breaker ?? defaultBreaker,
+    sessionLimiter: deps.sessionLimiter ?? defaultSessionLimiter,
+    globalLimiter: deps.globalLimiter ?? defaultGlobalLimiter,
+  };
+}
+
+function prepareContext({ session, snapshot, friction, maskValues, makeKey, schemaHash, PROMPT_VERSION }) {
+  const schema = snapshot.schema ?? {};
+  const values = snapshot.values ?? {};
+  const maskedValues = maskValues(schema, values);
+
+  const formId = session.formId || schema.formId || "form";
+  const sHash = schemaHash(schema);
+  const key = makeKey({
+    formId,
+    field: friction.field,
+    schemaHash: sHash,
+    promptVersion: PROMPT_VERSION,
+  });
+
+  return { schema, maskedValues, key };
+}
+
+function createComponentBuilder({
+  session,
+  friction,
+  schema,
+  maskedValues,
+  generate,
+  validate,
+  compile,
+  send,
+  log,
+  breaker,
+  globalLimiter,
+  signal,
+  emitProgress = true,
+}) {
+  return async function buildComponent() {
+    let lastProgressSent = 0;
+    let totalTokens = 0;
+
+    const onToken = emitProgress
+      ? (chunk) => {
+          totalTokens += typeof chunk === "string" ? chunk.length : 1;
+          const now = Date.now();
+          if (now - lastProgressSent >= 250) {
+            lastProgressSent = now;
+            send(session, "redesign:progress", { tokens: totalTokens });
+          }
+        }
+      : undefined;
+
+    // Bind exact validated code string to validation result to prevent bypass
+    let earlyValEntry = null;
+    let earlyValidateMs = 0;
+
+    const trackValidate = (candidate) => {
+      const tv0 = performance.now();
+      const res = validate(candidate);
+      earlyValidateMs += Math.round(performance.now() - tv0);
+      if (res?.ok) {
+        earlyValEntry = { code: candidate, res };
+      }
+      return res;
+    };
+
+    const invokeLlm = async (feedback) => {
+      globalLimiter.consume("global");
+      return breaker.execute(() =>
+        generate(
+          { friction, schema, values: maskedValues },
+          { onToken, signal, feedback, validate: trackValidate }
+        )
+      );
+    };
+
+    const tGen0 = performance.now();
+    let code = await invokeLlm(undefined);
+    const generateMs = Math.max(
+      0,
+      Math.round(performance.now() - tGen0) - earlyValidateMs
+    );
+
+    const tVal0 = performance.now();
+    let valResult =
+      earlyValEntry && earlyValEntry.code === code
+        ? earlyValEntry.res
+        : validate(code);
+
+    if (!valResult.ok) {
+      log.warn("unsafe_code_rejected", {
+        sessionId: session.id,
+        attempt: 1,
+        errorCount: valResult.errors.length,
+        errors: valResult.errors,
+      });
+
+      earlyValEntry = null;
+      const feedback = valResult.errors.join("\n");
+      code = await invokeLlm(feedback);
+
+      valResult =
+        earlyValEntry && earlyValEntry.code === code
+          ? earlyValEntry.res
+          : validate(code);
+
+      if (!valResult.ok) {
+        log.error("unsafe_code_rejected", {
+          sessionId: session.id,
+          attempt: 2,
+          errorCount: valResult.errors.length,
+          errors: valResult.errors,
+        });
+        throw new ValidationError(
+          "Generated component failed AST validation after retry",
+          valResult.errors
+        );
+      }
+    }
+    const validateMs = earlyValidateMs + Math.round(performance.now() - tVal0);
+
+    const tComp0 = performance.now();
+    const compResult = compile(valResult.ast, code);
+    if (!compResult.ok) {
+      log.error("redesign:compile_failed", {
+        sessionId: session.id,
+        errors: compResult.errors,
+      });
+      throw new CompileError(
+        "Failed to compile validated component",
+        compResult.errors
+      );
+    }
+    const compileMs = Math.round(performance.now() - tComp0);
+
+    return {
+      hash: compResult.hash,
+      js: compResult.js,
+      bytes: compResult.bytes,
+      timings: { generateMs, validateMs, compileMs },
+    };
+  };
+}
+
+/**
+ * Speculatively pre-warm the cache when friction is rising (>= 80% threshold).
+ * Uses cache.getOrCreate() single-flight so concurrent or subsequent startRedesign()
+ * calls never duplicate LLM work. Never emits redesign:started, ready, or failed.
+ */
+export async function prewarmRedesign(session, friction, deps = {}) {
+  const {
+    log,
+    config,
+    send,
+    requestSnapshot,
+    maskValues,
+    generate,
+    PROMPT_VERSION,
+    validate,
+    compile,
+    cache,
+    makeKey,
+    schemaHash,
+    breaker,
+    globalLimiter,
+  } = resolveDeps(deps);
+
+  if (config.PREWARM_ENABLED === false || session.redesigning || session.prewarming) {
+    return;
+  }
+
+  session.prewarming = true;
+  const t0 = performance.now();
+
+  try {
+    const tSnap0 = performance.now();
+    const snapshot = await requestSnapshot(session, "prewarm", 2000);
+    const snapshotMs = Math.round(performance.now() - tSnap0);
+
+    if (session.redesigning || session.socket?.readyState > 1) {
+      return;
+    }
+
+    const { schema, maskedValues, key } = prepareContext({
+      session,
+      snapshot,
+      friction,
+      maskValues,
+      makeKey,
+      schemaHash,
+      PROMPT_VERSION,
+    });
+
+    const wasCached = cache.has(key);
+    const builder = createComponentBuilder({
+      session,
+      friction,
+      schema,
+      maskedValues,
+      generate,
+      validate,
+      compile,
+      send,
+      log,
+      breaker,
+      globalLimiter,
+      signal: session.abortController?.signal,
+      emitProgress: false,
+    });
+
+    const result = await cache.getOrCreate(key, builder);
+    trackComponentKey(result.hash, key);
+
+    const totalMs = Math.round(performance.now() - t0);
+    log.info("prewarm_timing", {
+      sessionId: session.id,
+      componentId: result.hash,
+      snapshotMs,
+      generateMs: wasCached ? 0 : (result.timings?.generateMs ?? 0),
+      validateMs: wasCached ? 0 : (result.timings?.validateMs ?? 0),
+      compileMs: wasCached ? 0 : (result.timings?.compileMs ?? 0),
+      totalMs,
+      cached: wasCached,
+    });
+
+    return result;
+  } catch (err) {
+    log.warn("prewarm:error", {
+      sessionId: session?.id,
+      errorName: err.name,
+      message: err.message,
+    });
+    return undefined;
+  } finally {
+    session.prewarming = false;
+  }
+}
+
 /**
  * Orchestrate the redesign pipeline for a frustrated session.
- *
- * @param {object} session – active session object
- * @param {{ field: string|null, score: number }} friction – trigger friction context
- * @param {object} [deps] – injected dependencies for testability
  */
 export async function startRedesign(session, friction, deps = {}) {
-  const log = deps.log ?? defaultLog;
-  const config = deps.config ?? defaultConfig;
-  const send = deps.send ?? defaultSend;
-  const requestSnapshot = deps.requestSnapshot ?? defaultRequestSnapshot;
-  const maskValues = deps.maskValues ?? defaultMaskValues;
-  const generate = deps.generate ?? defaultGenerate;
-  const PROMPT_VERSION = deps.PROMPT_VERSION ?? DEFAULT_PROMPT_VERSION;
-  const validate = deps.validate ?? defaultValidate;
-  const compile = deps.compile ?? defaultCompile;
-  const cache = deps.cache ?? defaultCache;
-  const makeKey = deps.makeKey ?? defaultMakeKey;
-  const schemaHash = deps.schemaHash ?? defaultSchemaHash;
+  const {
+    log,
+    send,
+    requestSnapshot,
+    maskValues,
+    generate,
+    PROMPT_VERSION,
+    validate,
+    compile,
+    cache,
+    makeKey,
+    schemaHash,
+    breaker,
+    sessionLimiter,
+    globalLimiter,
+  } = resolveDeps(deps);
 
-  // ── Concurrency guard: only one redesign per session at a time ─────
   if (session.redesigning) {
     log.warn("redesign:already_running", { sessionId: session.id });
     return;
@@ -89,6 +356,9 @@ export async function startRedesign(session, friction, deps = {}) {
   const t0 = performance.now();
 
   try {
+    // 0. Per-session rate limit check (max 3 redesigns / 10 min)
+    sessionLimiter.consume(session.id);
+
     // 1. Notify browser that redesign has started
     send(session, "redesign:started", { friction });
 
@@ -97,136 +367,97 @@ export async function startRedesign(session, friction, deps = {}) {
     const snapshot = await requestSnapshot(session, "redesign", 2000);
     const snapshotMs = Math.round(performance.now() - tSnapshot0);
 
-    const schema = snapshot.schema ?? {};
-    const values = snapshot.values ?? {};
-    const maskedValues = maskValues(schema, values);
-
     // 3. Compute deterministic cache key (values are NEVER included)
-    const formId = session.formId || schema.formId || "form";
-    const sHash = schemaHash(schema);
-    const key = makeKey({
-      formId,
-      field: friction.field,
-      schemaHash: sHash,
-      promptVersion: PROMPT_VERSION,
+    const { schema, maskedValues, key } = prepareContext({
+      session,
+      snapshot,
+      friction,
+      maskValues,
+      makeKey,
+      schemaHash,
+      PROMPT_VERSION,
     });
 
     const wasCached = cache.has(key);
+    const wasInFlight = Boolean(cache.inFlight?.has(key));
 
     // 4. Component builder for cache misses
-    async function buildComponent() {
-      // Throttle progress token notifications to at most once per 250ms
-      let lastProgressSent = 0;
-      let totalTokens = 0;
+    const buildComponent = createComponentBuilder({
+      session,
+      friction,
+      schema,
+      maskedValues,
+      generate,
+      validate,
+      compile,
+      send,
+      log,
+      breaker,
+      globalLimiter,
+      signal: session.abortController?.signal,
+      emitProgress: true,
+    });
 
-      const onToken = (chunk) => {
-        totalTokens += (typeof chunk === "string" ? chunk.length : 1);
-        const now = Date.now();
-        if (now - lastProgressSent >= 250) {
-          lastProgressSent = now;
-          send(session, "redesign:progress", { tokens: totalTokens });
-        }
-      };
-
-      // Generation attempt 1
-      const tGen0 = performance.now();
-      let code = await generate(
-        { friction, schema, values: maskedValues },
-        { onToken }
-      );
-      const generateMs = Math.round(performance.now() - tGen0);
-
-      // Validation
-      const tVal0 = performance.now();
-      let valResult = validate(code);
-
-      // If validation fails, retry ONCE with feedback
-      if (!valResult.ok) {
-        log.warn("redesign:validation_failed", {
-          sessionId: session.id,
-          errorCount: valResult.errors.length,
-          errors: valResult.errors,
-        });
-
-        const feedback = valResult.errors.join("\n");
-        code = await generate(
-          { friction, schema, values: maskedValues },
-          { onToken, feedback }
-        );
-
-        valResult = validate(code);
-        if (!valResult.ok) {
-          log.error("redesign:validation_retry_failed", {
-            sessionId: session.id,
-            errorCount: valResult.errors.length,
-            errors: valResult.errors,
-          });
-          throw new ValidationError(
-            "Generated component failed AST validation after retry",
-            valResult.errors
-          );
-        }
-      }
-      const validateMs = Math.round(performance.now() - tVal0);
-
-      // Compilation
-      const tComp0 = performance.now();
-      const compResult = compile(valResult.ast, code);
-      if (!compResult.ok) {
-        log.error("redesign:compile_failed", {
-          sessionId: session.id,
-          errors: compResult.errors,
-        });
-        throw new CompileError(
-          "Failed to compile validated component",
-          compResult.errors
-        );
-      }
-      const compileMs = Math.round(performance.now() - tComp0);
-
-      return {
-        hash: compResult.hash,
-        js: compResult.js,
-        bytes: compResult.bytes,
-        timings: { generateMs, validateMs, compileMs },
-      };
-    }
-
-    // 5. Query or build via single-flight cache
+    // 5. Query or join single-flight build
     const result = await cache.getOrCreate(key, buildComponent);
 
-    // Map componentId -> key for potential render:result eviction
-    componentToKeyMap.set(result.hash, key);
+    trackComponentKey(result.hash, key);
+
+    if (!(session.deliveredComponents instanceof Set)) {
+      session.deliveredComponents = new Set();
+    }
+    session.deliveredComponents.add(result.hash);
 
     const totalMs = Math.round(performance.now() - t0);
 
-    // 6. Log structured timing telemetry
+    const stageGenerateMs = wasCached ? 0 : (result.timings?.generateMs ?? 0);
+    const stageValidateMs = wasCached ? 0 : (result.timings?.validateMs ?? 0);
+    const stageCompileMs = wasCached ? 0 : (result.timings?.compileMs ?? 0);
+
     log.info("redesign_timing", {
       sessionId: session.id,
       componentId: result.hash,
       snapshotMs,
-      generateMs: result.timings?.generateMs ?? 0,
-      validateMs: result.timings?.validateMs ?? 0,
-      compileMs: result.timings?.compileMs ?? 0,
+      generateMs: stageGenerateMs,
+      validateMs: stageValidateMs,
+      compileMs: stageCompileMs,
       totalMs,
       cached: wasCached,
+      coalesced: wasInFlight,
     });
 
-    // 7. Deliver component to browser
     send(session, "redesign:ready", {
       componentId: result.hash,
       version: 1,
       code: result.js,
       ms: totalMs,
       cached: wasCached,
+      timings: {
+        snapshotMs,
+        generateMs: stageGenerateMs,
+        validateMs: stageValidateMs,
+        compileMs: stageCompileMs,
+        totalMs,
+      },
     });
 
     session.lastRedesignAt = Date.now();
     return result;
   } catch (err) {
+    const reason = toReason(err);
+    try {
+      send(session, "redesign:failed", { reason });
+    } catch (sendErr) {
+      log.warn("redesign:failed_send_error", {
+        sessionId: session?.id,
+        error: sendErr.message,
+      });
+    }
+
     log.error("redesign:error", {
-      sessionId: session.id,
+      sessionId: session?.id,
       errorName: err.name,
+      reason,
       message: err.message,
     });
     throw err;

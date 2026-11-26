@@ -30,3 +30,11 @@ Thumbs.db
 # Agent skills & local harness configs
 .agents/
 skills-lock.json
+
+# Local context & documentation notes
+AI_FRONTEND_CONTEXT.md
+KARADUGATTU_YASWANTH_BRANCH_CONTEXT.md
+docs/BUILD_LOG_AND_VIVA.md
+docs/LINKEDIN_LAUNCH_KIT.md
+posts/
+

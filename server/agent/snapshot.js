@@ -66,16 +66,25 @@ export function requestSnapshot(session, reason, timeoutMs = 2000) {
 
 /**
  * Called by the WebSocket `snapshot:response` handler when the browser
- * returns the requested snapshot.
+ * returns the requested snapshot. Verifies session ownership when provided.
  *
- * @param {string} requestId – the ID from the incoming payload
- * @param {object} payload   – { schema, values }
+ * @param {string} requestId          – the ID from the incoming payload
+ * @param {object} payload            – { schema, values }
+ * @param {string} [expectedSessionId]– caller session ID for isolation
  * @returns {boolean} true if a matching request was found and resolved
  */
-export function resolveSnapshot(requestId, payload) {
+export function resolveSnapshot(requestId, payload, expectedSessionId) {
   const pending = pendingRequests.get(requestId);
   if (!pending) {
     log.warn("snapshot:unmatched_response", { requestId });
+    return false;
+  }
+
+  if (expectedSessionId && pending.sessionId !== expectedSessionId) {
+    log.warn("snapshot:session_mismatch", {
+      requestId,
+      sessionId: expectedSessionId,
+    });
     return false;
   }
 
@@ -88,8 +97,8 @@ export function resolveSnapshot(requestId, payload) {
   });
 
   pending.resolve({
-    schema: payload.schema ?? {},
-    values: payload.values ?? {},
+    schema: payload?.schema ?? {},
+    values: payload?.values ?? {},
   });
 
   return true;

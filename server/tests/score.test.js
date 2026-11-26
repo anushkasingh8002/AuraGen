@@ -220,6 +220,27 @@ describe("Robustness", () => {
     const metrics = win.snapshot(10_000);
     expect(metrics.speeds).toHaveLength(0);
   });
+
+  test("future-skewed timestamps are pruned and event burst stays bounded", () => {
+    const win = createWindow(10_000);
+    const now = 50_000;
+
+    // 1,200 events + a malicious 1-hour future focus event that would lock H=1.0
+    const burst = Array.from({ length: 1200 }, (_, i) => ({
+      k: "move",
+      v: 0.5,
+      t: now - 2000 + i,
+    }));
+    burst.push({ k: "focus", f: "income", t: now + 3_600_000 });
+    burst.push({ k: "error", f: "__proto__", t: now - 100 });
+
+    win.add(burst);
+    const metrics = win.snapshot(now);
+
+    expect(metrics.speeds.length).toBeLessThanOrEqual(1000);
+    expect(metrics.maxIdleSeconds).toBe(0);
+    expect(metrics.hotField).toBeNull();
+  });
 });
 
 describe("hotField", () => {

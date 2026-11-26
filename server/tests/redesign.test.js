@@ -5,8 +5,10 @@
 // RUN:  node --experimental-vm-modules node_modules/jest/bin/jest.js server/tests/redesign.test.js
 // ─────────────────────────────────────────────────────────────────────
 
-import { startRedesign, evictComponent } from "../pipeline/redesign.js";
+import { startRedesign, prewarmRedesign, evictComponent } from "../pipeline/redesign.js";
 import { LRUCache } from "../cache/cache.js";
+import { llmBreaker } from "../safety/breaker.js";
+import { sessionRedesignLimiter, globalLlmLimiter } from "../safety/rateLimit.js";
 import {
   SnapshotTimeoutError,
   ValidationError,
@@ -42,6 +44,9 @@ describe("Redesign Pipeline Integration", () => {
   };
 
   beforeEach(() => {
+    llmBreaker.reset();
+    sessionRedesignLimiter.clear();
+    globalLlmLimiter.clear();
     sentMessages = [];
     session = {
       id: "sess-test-42",
@@ -184,9 +189,13 @@ describe("Redesign Pipeline Integration", () => {
 
     expect(generateCalls).toBe(2); // Initial + 1 retry
 
-    // redesign:ready was never sent
+    // redesign:ready was never sent, but redesign:failed was sent with reason 'invalid'
     const readyMsg = sentMessages.find((m) => m.type === "redesign:ready");
     expect(readyMsg).toBeUndefined();
+
+    const failedMsg = sentMessages.find((m) => m.type === "redesign:failed");
+    expect(failedMsg).toBeDefined();
+    expect(failedMsg.payload.reason).toBe("invalid");
 
     // Cache remains empty
     expect(testCache.stats().size).toBe(0);
@@ -213,6 +222,10 @@ describe("Redesign Pipeline Integration", () => {
     await expect(startRedesign(session, friction, deps)).rejects.toThrow(
       SnapshotTimeoutError
     );
+
+    const failedMsg = sentMessages.find((m) => m.type === "redesign:failed");
+    expect(failedMsg).toBeDefined();
+    expect(failedMsg.payload.reason).toBe("snapshot_timeout");
 
     expect(generateCalled).toBe(false);
     expect(session.redesigning).toBe(false);
@@ -304,6 +317,118 @@ describe("Redesign Pipeline Integration", () => {
     // Simulate browser reporting render error
     const evicted = evictComponent(result.hash, testCache);
     expect(evicted).toBe(true);
+    expect(testCache.stats().size).toBe(0);
+  });
+
+  test("8. Speculative pre-warm: leaves result in cache quietly when user calms down", async () => {
+    let generateCalls = 0;
+
+    const deps = {
+      send: mockSend,
+      log: mockLog,
+      cache: testCache,
+      config: { PREWARM_ENABLED: true },
+      requestSnapshot: async () => ({
+        schema: sampleSchema,
+        values: sampleValues,
+      }),
+      generate: async () => {
+        generateCalls++;
+        return "valid code";
+      },
+      validate: () => ({ ok: true, ast: {} }),
+      compile: () => mockCompiled,
+    };
+
+    const res = await prewarmRedesign(session, friction, deps);
+    expect(res.hash).toBe(mockCompiled.hash);
+    expect(generateCalls).toBe(1);
+    expect(testCache.stats().size).toBe(1);
+    // Browser must NOT receive redesign:started, progress, ready, or failed
+    expect(sentMessages).toHaveLength(0);
+    expect(session.prewarming).toBe(false);
+  });
+
+  test("9. Speculative pre-warm + startRedesign share single-flight (exactly 1 LLM call)", async () => {
+    let generateCalls = 0;
+    let resolveGenerate;
+    const pendingGen = new Promise((resolve) => {
+      resolveGenerate = resolve;
+    });
+
+    const deps = {
+      send: mockSend,
+      log: mockLog,
+      cache: testCache,
+      config: { PREWARM_ENABLED: true },
+      requestSnapshot: async () => ({
+        schema: sampleSchema,
+        values: sampleValues,
+      }),
+      generate: async () => {
+        generateCalls++;
+        return pendingGen;
+      },
+      validate: () => ({ ok: true, ast: {} }),
+      compile: () => mockCompiled,
+    };
+
+    // Trigger background pre-warm first
+    const prewarmPromise = prewarmRedesign(session, friction, deps);
+    await new Promise((r) => setTimeout(r, 15));
+    expect(generateCalls).toBe(1);
+
+    // While pre-warm LLM generation is STILL in flight, trigger actual redesign
+    const redesignPromise = startRedesign(session, friction, deps);
+    await new Promise((r) => setTimeout(r, 15));
+
+    // Single-flight proves generate() was NOT called a second time
+    expect(generateCalls).toBe(1);
+
+    resolveGenerate("valid code");
+    const [prewarmRes, redesignRes] = await Promise.all([
+      prewarmPromise,
+      redesignPromise,
+    ]);
+
+    expect(prewarmRes.hash).toBe(mockCompiled.hash);
+    expect(redesignRes.hash).toBe(mockCompiled.hash);
+    expect(generateCalls).toBe(1);
+
+    const readyMsg = sentMessages.find((m) => m.type === "redesign:ready");
+    expect(readyMsg).toBeDefined();
+    expect(readyMsg.payload.cached).toBe(false); // joined in-flight cold build
+  });
+
+  test("10. Cross-session eviction defense: unrelated session cannot evict cached component", async () => {
+    const deps = {
+      send: mockSend,
+      log: mockLog,
+      cache: testCache,
+      requestSnapshot: async () => ({
+        schema: sampleSchema,
+        values: sampleValues,
+      }),
+      generate: async () => "valid code",
+      validate: () => ({ ok: true, ast: {} }),
+      compile: () => mockCompiled,
+    };
+
+    const result = await startRedesign(session, friction, deps);
+    expect(testCache.stats().size).toBe(1);
+
+    // An unrelated session without this component in deliveredComponents tries to evict it
+    const attackerSession = {
+      id: "sess-attacker",
+      deliveredComponents: new Set(),
+    };
+    const denied = evictComponent(result.hash, testCache, attackerSession);
+    expect(denied).toBe(false);
+    expect(testCache.stats().size).toBe(1);
+
+    // The legitimate recipient session CAN evict it
+    const allowed = evictComponent(result.hash, testCache, session);
+    expect(allowed).toBe(true);
     expect(testCache.stats().size).toBe(0);
   });
 });

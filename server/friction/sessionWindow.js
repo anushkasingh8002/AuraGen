@@ -18,6 +18,10 @@
  * @param {number} [spanMs=10000] – window width in ms (default 10 s)
  * @returns {{ add(events: object[]): void, snapshot(now: number): object }}
  */
+const MAX_WINDOW_EVENTS = 1000;
+const FUTURE_TS_SKEW_MS = 5000;
+const FORBIDDEN_FIELDS = new Set(["__proto__", "constructor", "prototype"]);
+
 export function createWindow(spanMs = 10_000) {
   /** @type {object[]} sorted by ascending `t` */
   let events = [];
@@ -26,21 +30,27 @@ export function createWindow(spanMs = 10_000) {
 
   /**
    * Push new telemetry events into the window.
-   * Events with a non-numeric or negative `t` are silently dropped.
+   * Events with invalid `t` or forbidden field names are dropped; array capped cleanly.
    */
   function add(batch) {
     if (!Array.isArray(batch)) return;
 
     for (const evt of batch) {
-      // Guard: every event must carry a valid timestamp.
+      if (!evt || typeof evt !== "object") continue;
       if (typeof evt.t !== "number" || !Number.isFinite(evt.t) || evt.t < 0) {
+        continue;
+      }
+      if (evt.f && FORBIDDEN_FIELDS.has(evt.f)) {
         continue;
       }
       events.push(evt);
     }
 
-    // Keep chronological order so snapshot() can reason about sequences.
+    // Keep chronological order and bound array size to prevent CPU starvation.
     events.sort((a, b) => a.t - b.t);
+    if (events.length > MAX_WINDOW_EVENTS) {
+      events = events.slice(events.length - MAX_WINDOW_EVENTS);
+    }
   }
 
   // ── snapshot ─────────────────────────────────────────────────────
@@ -61,9 +71,10 @@ export function createWindow(spanMs = 10_000) {
    * }}
    */
   function snapshot(now) {
-    // ── prune ────────────────────────────────────────────────────
+    // ── prune stale & future-skewed events ───────────────────────
     const cutoff = now - spanMs;
-    events = events.filter((e) => e.t >= cutoff);
+    const maxTs = now + FUTURE_TS_SKEW_MS;
+    events = events.filter((e) => e.t >= cutoff && e.t <= maxTs);
 
     // ── accumulators ─────────────────────────────────────────────
     const speeds = [];
