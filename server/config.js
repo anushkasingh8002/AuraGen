@@ -62,6 +62,12 @@ const config = Object.freeze({
   /** Max time to wait for the LLM to respond (ms) */
   LLM_TIMEOUT_MS: int(process.env.LLM_TIMEOUT_MS, 8000),
 
+  /** Max output tokens for generated React component */
+  MAX_OUTPUT_TOKENS: int(process.env.MAX_OUTPUT_TOKENS, 1200),
+
+  /** Speculative pre-warm when CLS is rising (>= 80% threshold) */
+  PREWARM_ENABLED: process.env.PREWARM_ENABLED !== "false",
+
   /** When true, skip real OpenAI calls and return canned output */
   MOCK_LLM,
 });

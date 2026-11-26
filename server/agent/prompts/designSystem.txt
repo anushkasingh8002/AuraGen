@@ -1,30 +1,8 @@
-DESIGN SYSTEM SPECIFICATION (@/ui COMPONENTS & TAILWIND STYLING)
-
-1. Button:
-   Props: { variant?: "primary" | "secondary" | "outline" | "danger", size?: "sm" | "md" | "lg", disabled?: boolean, onClick?: () => void, children: ReactNode }
-   Style: Tailwind rounded-lg font-medium transition focus:ring-2 focus:ring-offset-2.
-
-2. Input:
-   Props: { id: string, label?: string, type?: "text" | "number" | "email" | "tel", value?: string | number, placeholder?: string, helperText?: string, error?: string, required?: boolean, onChange: (e: ChangeEvent) => void }
-   Style: Tailwind w-full border border-gray-300 rounded-lg p-2.5 text-sm focus:border-blue-600 focus:ring-1 focus:ring-blue-600.
-
-3. Select:
-   Props: { id: string, label?: string, value?: string, options: Array<{ label: string, value: string }>, helperText?: string, onChange: (e: ChangeEvent) => void }
-   Style: Tailwind w-full border border-gray-300 rounded-lg p-2.5 text-sm bg-white.
-
-4. Card:
-   Props: { className?: string, children: ReactNode }
-   Style: Tailwind bg-white border border-gray-100 shadow-xl rounded-2xl p-6.
-
-5. ProgressBar:
-   Props: { current: number, total: number }
-   Style: Tailwind h-2 w-full bg-gray-100 rounded-full overflow-hidden (fill is bg-blue-600).
-
-6. Stepper:
-   Props: { steps: string[], currentStep: number }
-   Style: Tailwind flex items-center justify-between text-xs font-semibold.
-
-Tailwind layout guidelines:
-- Use space-y-4 or space-y-6 for vertical spacing between form groups.
-- Use flex justify-between for actions bars.
-- Primary color palette: blue-600 (primary action), gray-900 (headings), gray-600 (descriptions), red-600 (errors).
+@/ui PROPS & TAILWIND SPEC:
+- Button: { variant?: "primary"|"secondary"|"outline"|"danger", size?: "sm"|"md"|"lg", disabled?, onClick?, children }
+- Input: { id, label?, type?: "text"|"number"|"email"|"tel", value?, placeholder?, helperText?, error?, required?, onChange }
+- Select: { id, label?, value?, options: [{ label, value }], helperText?, onChange }
+- Card: { className?, children }
+- ProgressBar: { current, total }
+- Stepper: { steps: string[], currentStep }
+Layout: `space-y-4`, `flex justify-between`, `blue-600` primary, `gray-900` headings, `gray-600` copy, `red-600` errors.

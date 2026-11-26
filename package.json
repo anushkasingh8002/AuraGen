@@ -6,7 +6,12 @@
   "description": "AuraGen – self-healing generative UI backend",
   "scripts": {
     "dev": "node server/index.js",
-    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.js"
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config jest.config.js",
+    "sim:calm": "node scripts/simulate.js calm",
+    "sim:confused": "node scripts/simulate.js confused",
+    "sim:broken": "node scripts/simulate.js broken",
+    "sim:twice": "node scripts/simulate.js twice",
+    "bench:latency": "node scripts/latency.js"
   },
   "engines": {
     "node": ">=20.0.0"
