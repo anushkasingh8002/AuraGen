@@ -1,0 +1,8 @@
+@/ui PROPS & TAILWIND SPEC:
+- Button: { variant?: "primary"|"secondary"|"outline"|"danger", size?: "sm"|"md"|"lg", disabled?, onClick?, children }
+- Input: { id, label?, type?: "text"|"number"|"email"|"tel", value?, placeholder?, helperText?, error?, required?, onChange }
+- Select: { id, label?, value?, options: [{ label, value }], helperText?, onChange }
+- Card: { className?, children }
+- ProgressBar: { current, total }
+- Stepper: { steps: string[], currentStep }
+Layout: `space-y-4`, `flex justify-between`, `blue-600` primary, `gray-900` headings, `gray-600` copy, `red-600` errors.
