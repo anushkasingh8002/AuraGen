@@ -104,12 +104,15 @@ describe("Redesign Pipeline Integration", () => {
     // Verify messages sent to browser
     expect(sentMessages).toHaveLength(2);
     expect(sentMessages[0].type).toBe("redesign:started");
-    expect(sentMessages[0].payload).toEqual({ friction });
+    expect(sentMessages[0].payload).toEqual({
+      friction: { score: friction.score, field: null },
+    });
 
     expect(sentMessages[1].type).toBe("redesign:ready");
     expect(sentMessages[1].payload.componentId).toBe(mockCompiled.hash);
     expect(sentMessages[1].payload.version).toBe(1);
     expect(sentMessages[1].payload.code).toBe(mockCompiled.js);
+    expect(sentMessages[1].payload.friction).toEqual(friction);
     expect(sentMessages[1].payload.cached).toBe(false);
     expect(typeof sentMessages[1].payload.ms).toBe("number");
 
@@ -118,6 +121,46 @@ describe("Redesign Pipeline Integration", () => {
 
     // Verify session lock was released
     expect(session.redesigning).toBe(false);
+  });
+
+  test("sensitive schema, values, and friction identifiers never reach generation", async () => {
+    let generatedContext = null;
+    const deps = {
+      send: mockSend,
+      log: mockLog,
+      cache: testCache,
+      requestSnapshot: async () => ({
+        schema: {
+          formId: "private-form",
+          fields: [
+            { id: "email", label: "Email", type: "email" },
+            { id: "ssn", label: "SSN", type: "text" },
+            { id: "privateNotes", label: "Notes", type: "text", sensitive: true },
+          ],
+        },
+        values: {
+          email: "person@example.com",
+          ssn: "123-45-6789",
+          privateNotes: "private",
+        },
+      }),
+      generate: async (context) => {
+        generatedContext = context;
+        return "export default function W() { return <div />; }";
+      },
+      validate: () => ({ ok: true, ast: {} }),
+      compile: () => mockCompiled,
+    };
+
+    await startRedesign(session, { field: "ssn", score: 90 }, deps);
+
+    expect(generatedContext.schema.fields.map((field) => field.id)).toEqual([
+      "email",
+    ]);
+    expect(generatedContext.values).not.toHaveProperty("ssn");
+    expect(generatedContext.values).not.toHaveProperty("privateNotes");
+    expect(generatedContext.friction.field).toBeNull();
+    expect(sentMessages[0].payload.friction.field).toBeNull();
   });
 
   test("2. Validation failure then successful retry: feeds back errors to LLM once", async () => {

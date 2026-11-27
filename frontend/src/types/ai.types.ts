@@ -1,4 +1,15 @@
-export type FieldInputType = 'text' | 'number' | 'email' | 'tel' | 'select'
+export type FieldInputType =
+  | 'text'
+  | 'number'
+  | 'email'
+  | 'tel'
+  | 'date'
+  | 'time'
+  | 'url'
+  | 'password'
+  | 'checkbox'
+  | 'textarea'
+  | 'select'
 
 export interface UIInstructionField {
   id: string
@@ -32,7 +43,10 @@ export type UIMode = 'complex' | 'simplified'
 export interface RedesignEventPayload {
   requestId?: string
   instructions?: UIInstructions
+  componentId?: string
+  code?: string
   componentCode?: string
   reason?: string
   score?: number
+  friction?: { field?: string | null; score?: number }
 }

@@ -1,198 +1,227 @@
-import { useState, useEffect, useCallback } from 'react'
-import { UIInstructions, UIMode, RedesignEventPayload } from '../types/ai.types'
-import { FormData } from '../types/form.types'
-import { flattenFormData, mergeFlatIntoFormData, buildFormSchema } from '../lib/formDataBridge'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import type {
+  UIInstructions,
+  UIMode,
+  RedesignEventPayload,
+} from '../types/ai.types'
+import type { FormData } from '../types/form.types'
+import {
+  flattenFormData,
+  mergeFlatIntoFormData,
+  buildFormSchema,
+  buildSafeSnapshot,
+  buildUIInstructionsFromSchema,
+  type FormSchema,
+} from '../lib/formDataBridge'
 import { getSocket } from '../lib/socket'
 
 interface UseAIRedesignOptions {
   formData: FormData
   setFormData: React.Dispatch<React.SetStateAction<FormData>>
+  formSchema?: FormSchema
   sessionId?: string
   currentFormSection?: string
+}
+
+function createSchemaInstructions(
+  schema: FormSchema,
+  reason: string,
+  hotField?: string
+) {
+  return buildUIInstructionsFromSchema(schema, reason, hotField)
 }
 
 export function useAIRedesign({
   formData,
   setFormData,
+  formSchema,
   sessionId = 'session-default',
   currentFormSection = 'personal',
 }: UseAIRedesignOptions) {
+  const activeFormSchema = useMemo(
+    () => formSchema ?? buildFormSchema(),
+    [formSchema]
+  )
   const [uiMode, setUiMode] = useState<UIMode>('complex')
   const [instructions, setInstructions] = useState<UIInstructions | null>(null)
   const [isAiOptimizing, setIsAiOptimizing] = useState(false)
   const [redesignNotice, setRedesignNotice] = useState<string | null>(null)
 
-  // Sync flat values back into central form data immutably
+  const formDataRef = useRef(formData)
+  const sectionRef = useRef(currentFormSection)
+  const startedSessionRef = useRef<string | null>(null)
+  const hotFieldRef = useRef<string | undefined>()
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const simulationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  formDataRef.current = formData
+  sectionRef.current = currentFormSection
+
+  const showNotice = useCallback((notice: string, duration: number) => {
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current)
+    setRedesignNotice(notice)
+    noticeTimerRef.current = setTimeout(() => {
+      noticeTimerRef.current = null
+      setRedesignNotice(null)
+    }, duration)
+  }, [])
+
   const handleValuesChange = useCallback(
     (flatValues: Record<string, string>) => {
-      setFormData((prev) => mergeFlatIntoFormData(prev, flatValues))
+      setFormData((previous) => mergeFlatIntoFormData(previous, flatValues))
     },
     [setFormData]
   )
 
-  // Switch back to the complex full form
   const cancelRedesign = useCallback(() => {
+    if (simulationTimerRef.current) {
+      clearTimeout(simulationTimerRef.current)
+      simulationTimerRef.current = null
+    }
     setUiMode('complex')
-    setRedesignNotice('Returned to full multi-section form. All progress preserved.')
-    setTimeout(() => setRedesignNotice(null), 4000)
-  }, [])
+    showNotice(
+      'Returned to full multi-section form. All progress preserved.',
+      4000
+    )
+  }, [showNotice])
 
-  // Trigger simplified UI with explicit instructions
-  const activateSimplifiedUI = useCallback(
-    (aiInstructions: UIInstructions) => {
-      setInstructions(aiInstructions)
-      setUiMode('simplified')
-      setRedesignNotice(
-        `AI simplified form activated: ${aiInstructions.reason || 'Optimized for focus'}`
-      )
-      setTimeout(() => setRedesignNotice(null), 5000)
-    },
-    []
-  )
+  const activateSimplifiedUI = useCallback((nextInstructions: UIInstructions) => {
+    if (simulationTimerRef.current) {
+      clearTimeout(simulationTimerRef.current)
+      simulationTimerRef.current = null
+    }
+    setInstructions(nextInstructions)
+    setUiMode('simplified')
+    showNotice(
+      `AI simplified form activated: ${nextInstructions.reason || 'Optimized for focus'}`,
+      5000
+    )
+  }, [showNotice])
 
-  // Provide realistic simulated AI instructions for offline/mock demo
   const triggerSimulatedRedesign = useCallback(
     (customReason?: string, hotField?: string) => {
       setIsAiOptimizing(true)
-      setTimeout(() => {
-        const fieldName = hotField || 'financial figures'
-        const reason =
-          customReason ||
-          `Detected hesitation while filling ${fieldName}. Switched to step-by-step guidance.`
 
-        const mockInstructions: UIInstructions = {
-          version: '1.0',
-          mode: 'simplified_wizard',
-          reason,
-          frictionField: hotField,
-          steps: [
-            {
-              step: 1,
-              title: 'Your Full Legal Name',
-              description: 'We need your official identity details to check eligibility.',
-              fields: [
-                {
-                  id: 'fullName',
-                  label: 'Legal Full Name',
-                  type: 'text',
-                  placeholder: 'e.g. Jane Doe',
-                  required: true,
-                  helperText: 'As it appears on your official documents.',
-                },
-                {
-                  id: 'email',
-                  label: 'Email Address',
-                  type: 'email',
-                  placeholder: 'jane@example.com',
-                  required: true,
-                  helperText: 'For sending loan approval updates.',
-                },
-              ],
-            },
-            {
-              step: 2,
-              title: 'Monthly Income',
-              description: 'Enter your approximate take-home pay each month after tax.',
-              fields: [
-                {
-                  id: 'monthlyIncome',
-                  label: 'Monthly Net Income ($)',
-                  type: 'number',
-                  placeholder: 'e.g. 5000',
-                  required: true,
-                  helperText: 'Take-home pay after taxes and deductions.',
-                },
-                {
-                  id: 'employmentStatus',
-                  label: 'Employment Status',
-                  type: 'select',
-                  options: [
-                    { label: 'Employed Full-Time', value: 'Full-time' },
-                    { label: 'Employed Part-Time', value: 'Part-time' },
-                    { label: 'Self-Employed / Contractor', value: 'Self-employed' },
-                    { label: 'Retired', value: 'Retired' },
-                    { label: 'Other', value: 'Other' },
-                  ],
-                },
-              ],
-            },
-            {
-              step: 3,
-              title: 'Requested Loan Amount',
-              description: 'How much financing would you like to borrow?',
-              fields: [
-                {
-                  id: 'loanAmount',
-                  label: 'Loan Amount ($)',
-                  type: 'number',
-                  placeholder: 'e.g. 20000',
-                  required: true,
-                  helperText: 'Standard terms from 12 to 60 months.',
-                },
-                {
-                  id: 'purpose',
-                  label: 'Loan Purpose',
-                  type: 'text',
-                  placeholder: 'e.g. Debt Consolidation, Home Improvement',
-                  helperText: 'Helps us offer the lowest available interest rates.',
-                },
-              ],
-            },
-          ],
-        }
-
+      if (simulationTimerRef.current) clearTimeout(simulationTimerRef.current)
+      simulationTimerRef.current = setTimeout(() => {
+        simulationTimerRef.current = null
+        const reason = customReason ||
+          `Detected hesitation while filling ${hotField || 'your application'}. Switched to step-by-step guidance.`
         setIsAiOptimizing(false)
-        activateSimplifiedUI(mockInstructions)
+        activateSimplifiedUI(
+          createSchemaInstructions(activeFormSchema, reason, hotField)
+        )
       }, 400)
     },
-    [activateSimplifiedUI]
+    [activateSimplifiedUI, activeFormSchema]
   )
 
-  // Listen to WebSocket server messages
+  useEffect(() => () => {
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current)
+    if (simulationTimerRef.current) clearTimeout(simulationTimerRef.current)
+  }, [])
+
   useEffect(() => {
     const socket = getSocket()
 
-    // Announce session start
-    socket.emit('session:start', {
-      sessionId,
-      formId: 'loan-application-v1',
-      section: currentFormSection,
-    })
+    const startSession = () => {
+      if (startedSessionRef.current === sessionId) return
 
-    // 1. Respond to snapshot requests from AI agent
-    const handleSnapshotRequest = (data: { requestId: string; reason?: string }) => {
-      const flat = flattenFormData(formData)
-      const schema = buildFormSchema()
-
-      socket.emit('snapshot:response', {
-        requestId: data.requestId,
-        schema,
-        values: flat,
+      const sent = socket.emit('session:start', {
+        formId: activeFormSchema.formId || 'form',
+        section: sectionRef.current,
       })
+      if (sent) startedSessionRef.current = sessionId
     }
 
-    // 2. Handle incoming redesign instructions from AI
-    const handleUIRedesign = (payload: RedesignEventPayload) => {
-      setIsAiOptimizing(false)
-      if (payload?.instructions) {
-        activateSimplifiedUI(payload.instructions)
-      } else if (payload?.componentCode) {
-        triggerSimulatedRedesign(payload?.reason || 'AI agent generated simplified wizard')
+    const handleSnapshotRequest = (data: { requestId?: string }) => {
+      if (typeof data?.requestId !== 'string' || !data.requestId) return
+      const snapshot = buildSafeSnapshot(formDataRef.current, activeFormSchema)
+      const sent = socket.emit('snapshot:response', {
+        requestId: data.requestId,
+        ...snapshot,
+      })
+      if (!sent) {
+        setIsAiOptimizing(false)
+        showNotice(
+          'The snapshot could not be sent because the backend connection was lost.',
+          5000
+        )
       }
     }
 
+    const handleRedesignStarted = (payload: RedesignEventPayload) => {
+      setIsAiOptimizing(true)
+      hotFieldRef.current = payload?.friction?.field || undefined
+    }
+
+    const handleRedesignReady = (payload: RedesignEventPayload) => {
+      if (simulationTimerRef.current) {
+        clearTimeout(simulationTimerRef.current)
+        simulationTimerRef.current = null
+      }
+      setIsAiOptimizing(false)
+
+      const hasCompiledResult =
+        typeof payload?.code === 'string' &&
+        payload.code.length > 0 &&
+        typeof payload.componentId === 'string'
+      const hasStructuredResult = Boolean(payload?.instructions)
+      if (!hasCompiledResult && !hasStructuredResult) return
+
+      // The server's compiled code is never evaluated in the browser. The
+      // local form schema is converted into plain, data-only UI instructions.
+      const reason = payload.reason ||
+        'Sustained friction detected. Your form has been reorganized into guided steps.'
+      activateSimplifiedUI(
+        createSchemaInstructions(
+          activeFormSchema,
+          reason,
+          payload.friction?.field || hotFieldRef.current
+        )
+      )
+    }
+
+    const handleRedesignFailed = (payload: { reason?: string }) => {
+      setIsAiOptimizing(false)
+      showNotice(
+        `Redesign unavailable (${payload?.reason || 'unknown error'}). Your form data is unchanged.`,
+        5000
+      )
+    }
+
+    const handleConnect = () => startSession()
+    const handleDisconnect = () => {
+      if (simulationTimerRef.current) {
+        clearTimeout(simulationTimerRef.current)
+        simulationTimerRef.current = null
+      }
+      startedSessionRef.current = null
+      setIsAiOptimizing(false)
+    }
+
     socket.on('snapshot:request', handleSnapshotRequest)
-    socket.on('ui:instructions', handleUIRedesign)
-    socket.on('redesign:ready', handleUIRedesign)
-    socket.on('ai:redesign', handleUIRedesign)
+    socket.on('redesign:started', handleRedesignStarted)
+    socket.on('redesign:ready', handleRedesignReady)
+    socket.on('redesign:failed', handleRedesignFailed)
+    socket.on('ui:instructions', handleRedesignReady)
+    socket.on('ai:redesign', handleRedesignReady)
+    socket.on('connect', handleConnect)
+    socket.on('disconnect', handleDisconnect)
+
+    if (socket.connected) startSession()
 
     return () => {
       socket.off('snapshot:request', handleSnapshotRequest)
-      socket.off('ui:instructions', handleUIRedesign)
-      socket.off('redesign:ready', handleUIRedesign)
-      socket.off('ai:redesign', handleUIRedesign)
+      socket.off('redesign:started', handleRedesignStarted)
+      socket.off('redesign:ready', handleRedesignReady)
+      socket.off('redesign:failed', handleRedesignFailed)
+      socket.off('ui:instructions', handleRedesignReady)
+      socket.off('ai:redesign', handleRedesignReady)
+      socket.off('connect', handleConnect)
+      socket.off('disconnect', handleDisconnect)
     }
-  }, [formData, sessionId, currentFormSection, activateSimplifiedUI, triggerSimulatedRedesign])
+  }, [sessionId, activeFormSchema, activateSimplifiedUI, showNotice])
 
   return {
     uiMode,

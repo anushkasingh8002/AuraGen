@@ -15,12 +15,14 @@ const STEPS = [
 ]
 
 type Props = FormStateReturn
+type LoanApplicationFormProps = Props & { onSubmit?: () => void }
 
 export default function LoanApplicationForm({
   formData, errors, currentStep,
   updateField, updateTopLevel,
   nextStep, prevStep, goToStep,
-}: Props) {
+  onSubmit,
+}: LoanApplicationFormProps) {
   const steps = STEPS.map((s) => ({
     ...s,
     completed: s.id < currentStep,
@@ -80,7 +82,7 @@ export default function LoanApplicationForm({
           <Button onClick={nextStep}>Continue →</Button>
         ) : (
           <Button
-            onClick={() => alert('Application submitted! (Backend integration in Week 2)')}
+            onClick={onSubmit}
             disabled={!formData.agreeToTerms || !formData.agreeToCredit}
           >
             Submit Application ✓

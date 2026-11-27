@@ -11,6 +11,9 @@ import { redact } from "../safety/logger.js";
 import { requestSnapshot, resolveSnapshot } from "../agent/snapshot.js";
 import { CircuitOpenError, RateLimitError, toReason } from "../safety/errors.js";
 import { server, sessions } from "../index.js";
+import config from "../config.js";
+
+const ALLOWED_ORIGIN = config.ALLOWED_ORIGINS[0];
 
 describe("Circuit Breaker (breaker.js)", () => {
   test("opens after 5 consecutive failures, half-opens after 60s, and closes on success", async () => {
@@ -176,7 +179,7 @@ describe("WebSocket Security & DoS Hardening (server/index.js)", () => {
   test("drops client flooding > 100 messages/second with close code 1008", async () => {
     const closeInfo = await new Promise((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${port}`, {
-        headers: { origin: "http://localhost:3000" },
+        headers: { origin: ALLOWED_ORIGIN },
       });
       ws.on("open", () => {
         ws.send(JSON.stringify({ type: "session:start", payload: { formId: "flood-test" } }));
@@ -202,7 +205,7 @@ describe("WebSocket Security & DoS Hardening (server/index.js)", () => {
   test("closes oversized (> 64 KB) WebSocket payload without crashing server", async () => {
     const result = await new Promise((resolve) => {
       const ws = new WebSocket(`ws://127.0.0.1:${port}`, {
-        headers: { origin: "http://localhost:3000" },
+        headers: { origin: ALLOWED_ORIGIN },
       });
       ws.on("open", () => {
         const oversized = "x".repeat(70 * 1024);
@@ -228,7 +231,7 @@ describe("WebSocket Security & DoS Hardening (server/index.js)", () => {
 
     await new Promise((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${port}`, {
-        headers: { origin: "http://localhost:3000" },
+        headers: { origin: ALLOWED_ORIGIN },
       });
       ws.on("open", () => {
         ws.send(JSON.stringify({ type: "session:start", payload: { formId: "disconnect-test" } }));

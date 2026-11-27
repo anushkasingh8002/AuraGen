@@ -28,6 +28,7 @@ import {
   resolveSnapshot,
   clearPendingSnapshots,
 } from "./agent/snapshot.js";
+import { isFieldSensitive } from "./agent/mask.js";
 import cache from "./cache/cache.js";
 import {
   startRedesign,
@@ -115,6 +116,9 @@ handlers["telemetry:batch"] = async (session, payload) => {
 
   const now = Date.now();
   const metrics = session.window.snapshot(now);
+  const hotField = isFieldSensitive(metrics.hotField, null)
+    ? null
+    : metrics.hotField;
   const { score, parts } = computeCLS(metrics);
 
   send(session, "score:update", { score, parts });
@@ -123,7 +127,7 @@ handlers["telemetry:batch"] = async (session, payload) => {
     sessionId: session.id,
     score,
     parts,
-    hotField: metrics.hotField,
+    hotField,
   });
 
   if (!session.trigger) {
@@ -136,7 +140,7 @@ handlers["telemetry:batch"] = async (session, payload) => {
 
   const { fire, friction } = session.trigger.update(
     score,
-    metrics.hotField,
+    hotField,
     now
   );
 
@@ -158,9 +162,9 @@ handlers["telemetry:batch"] = async (session, payload) => {
     log.info("prewarm_started", {
       sessionId: session.id,
       score,
-      field: metrics.hotField,
+      field: hotField,
     });
-    prewarmRedesign(session, { field: metrics.hotField, score }).catch((err) => {
+    prewarmRedesign(session, { field: hotField, score }).catch((err) => {
       log.warn("prewarm:uncaught_error", {
         sessionId: session.id,
         error: err.message,
@@ -246,6 +250,13 @@ handlers["wizard:submit"] = async (session, payload) => {
 
 wss.on("connection", (socket, req) => {
   const origin = req.headers.origin ?? "";
+  let sessionId = null;
+
+  // Attach before origin/session checks so protocol errors (including
+  // oversized frames) can never become unhandled socket errors.
+  socket.on("error", (err) => {
+    log.error("ws:error", { sessionId, message: err.message });
+  });
 
   if (!config.ALLOWED_ORIGINS.includes(origin)) {
     log.warn("ws:rejected", { origin, reason: "origin_not_allowed" });
@@ -259,7 +270,7 @@ wss.on("connection", (socket, req) => {
     return;
   }
 
-  const sessionId = crypto.randomUUID();
+  sessionId = crypto.randomUUID();
   const msgTimestamps = [];
 
   const session = {
@@ -357,9 +368,6 @@ wss.on("connection", (socket, req) => {
     });
   });
 
-  socket.on("error", (err) => {
-    log.error("ws:error", { sessionId, message: err.message });
-  });
 });
 
 // ── heartbeat ────────────────────────────────────────────────────────

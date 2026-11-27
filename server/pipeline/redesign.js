@@ -9,7 +9,12 @@ import defaultLog from "../safety/logger.js";
 import defaultConfig from "../config.js";
 import { send as defaultSend } from "../ws/send.js";
 import { requestSnapshot as defaultRequestSnapshot } from "../agent/snapshot.js";
-import { maskValues as defaultMaskValues } from "../agent/mask.js";
+import {
+  isFieldSensitive,
+  maskValues as defaultMaskValues,
+  sanitizeSchema,
+  sanitizeValues,
+} from "../agent/mask.js";
 import {
   generate as defaultGenerate,
   PROMPT_VERSION as DEFAULT_PROMPT_VERSION,
@@ -94,20 +99,27 @@ function resolveDeps(deps = {}) {
 }
 
 function prepareContext({ session, snapshot, friction, maskValues, makeKey, schemaHash, PROMPT_VERSION }) {
-  const schema = snapshot.schema ?? {};
-  const values = snapshot.values ?? {};
+  const originalSchema = snapshot.schema ?? {};
+  const schema = sanitizeSchema(originalSchema);
+  const values = sanitizeValues(originalSchema, snapshot.values ?? {});
   const maskedValues = maskValues(schema, values);
+  const safeFriction = {
+    score: Number.isFinite(friction?.score) ? friction.score : 0,
+    field: isFieldSensitive(friction?.field, originalSchema)
+      ? null
+      : friction?.field ?? null,
+  };
 
   const formId = session.formId || schema.formId || "form";
   const sHash = schemaHash(schema);
   const key = makeKey({
     formId,
-    field: friction.field,
+    field: safeFriction.field,
     schemaHash: sHash,
     promptVersion: PROMPT_VERSION,
   });
 
-  return { schema, maskedValues, key };
+  return { schema, maskedValues, safeFriction, key };
 }
 
 function createComponentBuilder({
@@ -271,7 +283,7 @@ export async function prewarmRedesign(session, friction, deps = {}) {
       return;
     }
 
-    const { schema, maskedValues, key } = prepareContext({
+    const { schema, maskedValues, safeFriction, key } = prepareContext({
       session,
       snapshot,
       friction,
@@ -284,7 +296,7 @@ export async function prewarmRedesign(session, friction, deps = {}) {
     const wasCached = cache.has(key);
     const builder = createComponentBuilder({
       session,
-      friction,
+      friction: safeFriction,
       schema,
       maskedValues,
       generate,
@@ -360,7 +372,11 @@ export async function startRedesign(session, friction, deps = {}) {
     sessionLimiter.consume(session.id);
 
     // 1. Notify browser that redesign has started
-    send(session, "redesign:started", { friction });
+    const safeFriction = {
+      score: Number.isFinite(friction?.score) ? friction.score : 0,
+      field: null,
+    };
+    send(session, "redesign:started", { friction: safeFriction });
 
     // 2. Request DOM snapshot from browser (timeout: 2000ms)
     const tSnapshot0 = performance.now();
@@ -368,7 +384,12 @@ export async function startRedesign(session, friction, deps = {}) {
     const snapshotMs = Math.round(performance.now() - tSnapshot0);
 
     // 3. Compute deterministic cache key (values are NEVER included)
-    const { schema, maskedValues, key } = prepareContext({
+    const {
+      schema,
+      maskedValues,
+      safeFriction: safeFrictionFromSchema,
+      key,
+    } = prepareContext({
       session,
       snapshot,
       friction,
@@ -384,7 +405,7 @@ export async function startRedesign(session, friction, deps = {}) {
     // 4. Component builder for cache misses
     const buildComponent = createComponentBuilder({
       session,
-      friction,
+      friction: safeFrictionFromSchema,
       schema,
       maskedValues,
       generate,
@@ -430,6 +451,7 @@ export async function startRedesign(session, friction, deps = {}) {
       componentId: result.hash,
       version: 1,
       code: result.js,
+      friction: safeFrictionFromSchema,
       ms: totalMs,
       cached: wasCached,
       timings: {

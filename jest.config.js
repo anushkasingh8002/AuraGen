@@ -9,6 +9,5 @@ export default {
   transform: {},
 
   // Where to find test files.
-  testMatch: ["**/server/tests/**/*.test.js"],
+  testMatch: ["**/server/tests/**/*.test.js", "**/frontend/src/**/*.test.js"],
 };
-

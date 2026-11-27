@@ -20,7 +20,7 @@ export default function SelectField({
 }: SelectFieldProps) {
   return (
     <div className="flex flex-col gap-1">
-      <label className="label-base">
+      <label className="label-base" htmlFor={props.id}>
         {label}
         {props.required && <span className="text-red-500 ml-0.5">*</span>}
       </label>

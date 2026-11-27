@@ -1,26 +1,61 @@
+
 import { useEffect, useRef, useCallback, useState } from 'react'
-import { TelemetrySnapshot, FrictionPayload } from '../types/telemetry.types'
+import { TelemetrySnapshot } from '../types/telemetry.types'
 import { getSocket } from '../lib/socket'
 
-// ── Constants ────────────────────────────────────────────────────────────────
-const EMIT_INTERVAL_MS      = 500   // how often we sample & emit
-const RAGE_CLICK_WINDOW_MS  = 600   // window to detect rage clicks
-const RAGE_CLICK_THRESHOLD  = 3     // clicks in window = rage
-const HIGH_LOAD_THRESHOLD   = 65    // score that triggers AI morph
-const MOUSE_HISTORY_WINDOW  = 300   // ms of cursor history to keep
+const EMIT_INTERVAL_MS = 500
+const MOUSE_SAMPLE_INTERVAL_MS = 100
+const RAGE_CLICK_WINDOW_MS = 600
+const RAGE_CLICK_THRESHOLD = 3
+
+const MAX_QUEUED_EVENTS = 1000
+const MAX_BATCH_SIZE = 200
+const SENSITIVE_FIELD_ID_PARTS = [
+  'ssn', 'socialsecurity', 'password', 'account', 'card', 'cvv',
+  'otp', 'passport', 'license', 'routing', 'iban', 'pin', 'secret',
+]
+
+type TelemetryEvent = {
+  k: 'move' | 'click' | 'error' | 'focus' | 'blur' | 'input'
+  v?: number
+  t: number
+  f?: string
+  rage?: boolean
+  inert?: boolean
+}
 
 interface Options {
   sessionId: string
   formSection: string
   enabled?: boolean
-  onHighCognitiveLoad?: (snap: TelemetrySnapshot) => void
+}
+
+function getFieldId(target: EventTarget | null): string | undefined {
+  if (!(target instanceof HTMLElement)) return undefined
+
+  const field = target.closest(
+    'input, select, textarea, button, [role="button"]'
+  ) as HTMLElement | null
+
+  if (!field) return undefined
+
+  const id = field.getAttribute('name') || field.id
+
+  // Send field identifiers only, never field values.
+  if (!id || id.length > 100) return undefined
+
+  const normalizedId = id.toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (SENSITIVE_FIELD_ID_PARTS.some((part) => normalizedId.includes(part))) {
+    return undefined
+  }
+
+  return id
 }
 
 export function useFrictionEngine({
   sessionId,
   formSection,
   enabled = true,
-  onHighCognitiveLoad,
 }: Options) {
   const [snapshot, setSnapshot] = useState<TelemetrySnapshot>({
     cognitiveLoadScore: 0,
@@ -32,151 +67,291 @@ export function useFrictionEngine({
     sessionDuration: 0,
   })
 
-  // Mutable refs — no re-render on change
-  const mouseHistory    = useRef<{ x: number; y: number; ts: number }[]>([])
+  const eventQueue = useRef<TelemetryEvent[]>([])
+  const mouseHistory = useRef<{ x: number; y: number; ts: number }[]>([])
   const clickTimestamps = useRef<number[]>([])
-  const hesitationTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const hesitation      = useRef(0)
-  const rageClicks      = useRef(0)
-  const errorRetries    = useRef(0)
-  const activeField     = useRef<string | null>(null)
-  const sessionStart    = useRef(Date.now())
-  const emitTimer       = useRef<ReturnType<typeof setInterval> | null>(null)
-  const lastScore       = useRef(0)
+  const activeField = useRef<string | null>(null)
+  const rageClicks = useRef(0)
+  const errorRetries = useRef(0)
+  const lastMouseSample = useRef(0)
+  const lastMousePosition = useRef<{ x: number; y: number; ts: number } | null>(
+    null
+  )
+  const lastInputAt = useRef(Date.now())
+  const sessionStart = useRef(Date.now())
+  const lastServerScore = useRef(0)
 
-  // ── Signal collectors ───────────────────────────────────────────────────────
 
-  const handleMouseMove = useCallback((e: MouseEvent) => {
-    const now = Date.now()
-    mouseHistory.current.push({ x: e.clientX, y: e.clientY, ts: now })
-    mouseHistory.current = mouseHistory.current.filter((p) => now - p.ts < MOUSE_HISTORY_WINDOW)
+  // Add a raw event to the bounded queue.
+  const queueEvent = useCallback((event: TelemetryEvent) => {
+    eventQueue.current.push(event)
 
-    // Reset hesitation decay timer on movement
-    if (hesitationTimer.current) clearTimeout(hesitationTimer.current)
-    hesitationTimer.current = setTimeout(() => {
-      // Cursor stopped — accumulate hesitation
-      hesitation.current = Math.min(hesitation.current + 15, 100)
-    }, 1500)
-  }, [])
-
-  const handleClick = useCallback(() => {
-    const now = Date.now()
-    clickTimestamps.current.push(now)
-    clickTimestamps.current = clickTimestamps.current.filter(
-      (t) => now - t < RAGE_CLICK_WINDOW_MS
-    )
-    if (clickTimestamps.current.length >= RAGE_CLICK_THRESHOLD) {
-      rageClicks.current += 1
-      clickTimestamps.current = []
+    if (eventQueue.current.length > MAX_QUEUED_EVENTS) {
+      eventQueue.current.splice(
+        0,
+        eventQueue.current.length - MAX_QUEUED_EVENTS
+      )
     }
   }, [])
 
-  const handleFocus = useCallback((e: FocusEvent) => {
-    const target = e.target as HTMLElement
-    activeField.current =
-      target.getAttribute('name') || target.getAttribute('id') || 'field'
-  }, [])
-
-  const handleBlur = useCallback((e: FocusEvent) => {
-    const target = e.target as HTMLInputElement
-    if (target.validity && !target.validity.valid) {
-      errorRetries.current += 1
-    }
-    activeField.current = null
-  }, [])
-
-  // ── Cognitive Load Score formula ────────────────────────────────────────────
-  // velocity_factor:    erratic/high px speed → up to 40 pts
-  // hesitation_factor:  idle accumulation → up to 30 pts
-  // rage_click_factor:  rage bursts → 25 pts each, capped 40
-  // retry_factor:       invalid field retries → 10 pts each, capped 20
-
-  const computeScore = useCallback((): number => {
-    const h = mouseHistory.current
-    let velocity = 0
-    if (h.length >= 2) {
-      const a = h[0], b = h[h.length - 1]
-      const dt = b.ts - a.ts
-      if (dt > 0) {
-        velocity = Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2) / dt
-      }
-    }
-
-    const velocityFactor   = velocity > 2 ? Math.min((velocity - 2) * 10, 40) : velocity < 0.1 ? 20 : 0
-    const hesitationFactor = Math.min(hesitation.current * 0.3, 30)
-    const rageFactor       = Math.min(rageClicks.current * 25, 40)
-    const retryFactor      = Math.min(errorRetries.current * 10, 20)
-
-    return Math.min(Math.round(velocityFactor + hesitationFactor + rageFactor + retryFactor), 100)
-  }, [])
-
-  // ── Emit loop ───────────────────────────────────────────────────────────────
-  const emitSnapshot = useCallback(() => {
-    const h = mouseHistory.current
-    let velocity = 0
-    if (h.length >= 2) {
-      const a = h[0], b = h[h.length - 1]
-      const dt = b.ts - a.ts
-      if (dt > 0) velocity = Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2) / dt
-    }
-
-    const score = computeScore()
-    const snap: TelemetrySnapshot = {
-      cognitiveLoadScore: score,
-      cursorVelocity:     parseFloat(velocity.toFixed(3)),
-      hesitationScore:    Math.round(hesitation.current),
-      rageClickCount:     Math.round(rageClicks.current),
-      errorRetryCount:    errorRetries.current,
-      activeField:        activeField.current,
-      sessionDuration:    Date.now() - sessionStart.current,
-    }
-
-    setSnapshot(snap)
-
-    // Delta-gate: only emit if score changed ≥5 or is high
-    if (Math.abs(score - lastScore.current) >= 5 || score >= HIGH_LOAD_THRESHOLD) {
-      const payload: FrictionPayload = {
-        sessionId,
-        snapshot: snap,
-        formSection,
-        timestamp: Date.now(),
-      }
-      try { getSocket().emit('telemetry:friction', payload) } catch { /* not connected yet */ }
-      lastScore.current = score
-
-      if (score >= HIGH_LOAD_THRESHOLD) onHighCognitiveLoad?.(snap)
-    }
-
-    // Decay signals over time
-    hesitation.current  = Math.max(0, hesitation.current - 2)
-    rageClicks.current  = Math.max(0, rageClicks.current - 0.1)
-  }, [computeScore, sessionId, formSection, onHighCognitiveLoad])
-
-  // ── Lifecycle ────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!enabled) return
+
+    const socket = getSocket()
+    sessionStart.current = Date.now()
+
+    // The backend associates telemetry with the current WebSocket session.
+    // sessionId and formSection are intentionally not sent in the event batch.
+    void sessionId
+    void formSection
+
+    const handleMouseMove = (event: MouseEvent) => {
+      const now = Date.now()
+
+      if (now - lastMouseSample.current < MOUSE_SAMPLE_INTERVAL_MS) return
+
+      lastMouseSample.current = now
+
+      const previous = lastMousePosition.current
+
+      if (previous) {
+        const dt = now - previous.ts
+
+        if (dt > 0) {
+          const distance = Math.sqrt(
+            (event.clientX - previous.x) ** 2 +
+            (event.clientY - previous.y) ** 2
+          )
+
+          const velocity = distance / dt
+
+          mouseHistory.current.push({
+            x: event.clientX,
+            y: event.clientY,
+            ts: now,
+          })
+
+          queueEvent({
+            k: 'move',
+            v: Number(velocity.toFixed(3)),
+            t: now,
+          })
+        }
+      }
+
+      lastMousePosition.current = {
+        x: event.clientX,
+        y: event.clientY,
+        ts: now,
+      }
+    }
+
+    const handleClick = (event: MouseEvent) => {
+      const now = Date.now()
+      const target = event.target as HTMLElement | null
+      const field = getFieldId(target)
+
+      clickTimestamps.current.push(now)
+      clickTimestamps.current = clickTimestamps.current.filter(
+        (timestamp) => now - timestamp <= RAGE_CLICK_WINDOW_MS
+      )
+
+      let isRageClick = false
+
+      if (clickTimestamps.current.length >= RAGE_CLICK_THRESHOLD) {
+        isRageClick = true
+        rageClicks.current += 1
+        clickTimestamps.current = []
+      }
+
+      const inertElement = target?.closest(
+        '[disabled], [aria-disabled="true"]'
+      )
+
+      queueEvent({
+        k: 'click',
+        t: now,
+        f: field,
+        rage: isRageClick,
+        inert: Boolean(inertElement),
+      })
+    }
+
+    const handleFocus = (event: FocusEvent) => {
+      const now = Date.now()
+      const field = getFieldId(event.target)
+
+      activeField.current = field || null
+      lastInputAt.current = now
+
+      queueEvent({
+        k: 'focus',
+        t: now,
+        f: field,
+      })
+    }
+
+    const handleBlur = (event: FocusEvent) => {
+      const now = Date.now()
+      const target = event.target as HTMLInputElement
+      const field = getFieldId(event.target)
+
+      if (target.validity && !target.validity.valid) {
+        errorRetries.current += 1
+
+        queueEvent({
+          k: 'error',
+          t: now,
+          f: field,
+        })
+      }
+
+      queueEvent({
+        k: 'blur',
+        t: now,
+        f: field,
+      })
+
+      activeField.current = null
+    }
+
+    const handleInput = (event: Event) => {
+      const now = Date.now()
+      const field = getFieldId(event.target)
+
+      lastInputAt.current = now
+
+      // Never transmit the actual input value.
+      queueEvent({
+        k: 'input',
+        t: now,
+        f: field,
+      })
+    }
+
+    // Backend is the source of truth for cognitive-load score.
+    const handleScoreUpdate = (payload: {
+      score?: number
+      parts?: { V?: number; H?: number; R?: number; E?: number }
+    }) => {
+      if (
+        typeof payload?.score !== 'number' ||
+        !Number.isFinite(payload.score)
+      ) {
+        return
+      }
+
+      const score = Math.max(0, Math.min(100, payload.score))
+
+      setSnapshot((previous) => {
+        const updated: TelemetrySnapshot = {
+          ...previous,
+          cognitiveLoadScore: score,
+          cursorVelocity: previous.cursorVelocity,
+          hesitationScore: Math.round((payload.parts?.H ?? 0) * 100),
+        }
+
+        // Trigger only when the server score crosses the high-load threshold.
+
+        return updated
+      })
+
+      // Allow another high-load notification after the score recovers.
+      if (score < 60) {
+        lastServerScore.current = 0
+      } else {
+        lastServerScore.current = score
+      }
+    }
+
+    // Send queued events in backend-compatible batches.
+    const flushEvents = () => {
+      if (!socket.connected) return
+
+      const batch = eventQueue.current.slice(0, MAX_BATCH_SIZE)
+      if (socket.emit('telemetry:batch', batch)) {
+        eventQueue.current.splice(0, batch.length)
+      }
+    }
+
+    const updateLocalSnapshot = () => {
+      const now = Date.now()
+      const previous = lastMousePosition.current
+
+      const velocity = previous
+        ? Math.max(0, Number(
+            (
+             Math.sqrt(
+  (previous.x - (mouseHistory.current[mouseHistory.current.length - 1]?.x ?? previous.x)) ** 2 +
+  (previous.y - (mouseHistory.current[mouseHistory.current.length - 1]?.y ?? previous.y)) ** 2
+) / Math.max(now - previous.ts, 1)
+).toFixed(3)
+))
+: 0
+
+      const idleDuration = activeField.current
+        ? Math.min(now - lastInputAt.current, 15000)
+        : 0
+
+      setSnapshot((previousSnapshot) => ({
+        ...previousSnapshot,
+        cursorVelocity: velocity,
+        hesitationScore: Math.round((idleDuration / 15000) * 100),
+        rageClickCount: rageClicks.current,
+        errorRetryCount: errorRetries.current,
+        activeField: activeField.current,
+        sessionDuration: now - sessionStart.current,
+      }))
+    }
+
+    // Register listeners.
     document.addEventListener('mousemove', handleMouseMove, { passive: true })
-    document.addEventListener('click',    handleClick)
-    document.addEventListener('focusin',  handleFocus)
+    document.addEventListener('click', handleClick)
+    document.addEventListener('focusin', handleFocus)
     document.addEventListener('focusout', handleBlur)
-    emitTimer.current = setInterval(emitSnapshot, EMIT_INTERVAL_MS)
+    document.addEventListener('input', handleInput)
+
+    socket.on('score:update', handleScoreUpdate)
+
+    const emitTimer = setInterval(() => {
+      flushEvents()
+      updateLocalSnapshot()
+    }, EMIT_INTERVAL_MS)
+
     return () => {
       document.removeEventListener('mousemove', handleMouseMove)
-      document.removeEventListener('click',    handleClick)
-      document.removeEventListener('focusin',  handleFocus)
+      document.removeEventListener('click', handleClick)
+      document.removeEventListener('focusin', handleFocus)
       document.removeEventListener('focusout', handleBlur)
-      if (emitTimer.current)   clearInterval(emitTimer.current)
-      if (hesitationTimer.current) clearTimeout(hesitationTimer.current)
+      document.removeEventListener('input', handleInput)
+
+      socket.off('score:update', handleScoreUpdate)
+
+      clearInterval(emitTimer)
     }
-  }, [enabled, handleMouseMove, handleClick, handleFocus, handleBlur, emitSnapshot])
+  }, [enabled, queueEvent, sessionId, formSection])
 
   const reset = useCallback(() => {
-    hesitation.current = 0
-    rageClicks.current = 0
-    errorRetries.current = 0
-    lastScore.current = 0
+    eventQueue.current = []
     mouseHistory.current = []
     clickTimestamps.current = []
+    activeField.current = null
+    rageClicks.current = 0
+    errorRetries.current = 0
+    lastServerScore.current = 0
+    lastInputAt.current = Date.now()
+    sessionStart.current = Date.now()
+    lastMousePosition.current = null
+
+    setSnapshot({
+      cognitiveLoadScore: 0,
+      cursorVelocity: 0,
+      hesitationScore: 0,
+      rageClickCount: 0,
+      errorRetryCount: 0,
+      activeField: null,
+      sessionDuration: 0,
+    })
   }, [])
 
   return { snapshot, reset }

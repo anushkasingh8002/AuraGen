@@ -1,12 +1,12 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useFormState } from './hooks/useFormState'
 import { useFrictionEngine } from './hooks/useFrictionEngine'
 import { useAIRedesign } from './hooks/useAIRedesign'
 import LoanApplicationForm from './components/form/LoanApplicationForm'
-import SimplifiedLoanWizard from './components/form/SimplifiedLoanWizard'
 import DynamicUIInstructionRenderer from './components/form/DynamicUIInstructionRenderer'
 import CognitiveLoadIndicator from './components/debug/CognitiveLoadIndicator'
 import { useSocketConnection } from './hooks/useSocketConnection'
+import { mergeFlatIntoFormData } from './lib/formDataBridge'
 
 const SECTION_NAMES: Record<number, string> = {
   1: 'personal',
@@ -19,8 +19,35 @@ const SECTION_NAMES: Record<number, string> = {
 function App() {
   const formState = useFormState()
   const { formData, setFormData, currentStep } = formState
-  const { status: socketStatus } = useSocketConnection()
+  const { status: socketStatus, socket, emit } = useSocketConnection()
   const [showDebug, setShowDebug] = useState(true)
+  const [submissionStatus, setSubmissionStatus] = useState('')
+  const submissionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    if (!socket) return
+
+    const handleSubmitAck = (payload: { ok?: boolean }) => {
+      if (submissionTimeoutRef.current) {
+        clearTimeout(submissionTimeoutRef.current)
+        submissionTimeoutRef.current = null
+      }
+      setSubmissionStatus(
+        payload?.ok === true
+          ? 'Application received by the demo backend. No data is persisted.'
+          : 'The backend did not confirm the application.'
+      )
+    }
+
+    socket.on('submit:ack', handleSubmitAck)
+    return () => {
+      socket.off('submit:ack', handleSubmitAck)
+      if (submissionTimeoutRef.current) {
+        clearTimeout(submissionTimeoutRef.current)
+        submissionTimeoutRef.current = null
+      }
+    }
+  }, [socket])
 
   // Current active section name for telemetry
   const activeSection = SECTION_NAMES[currentStep] || 'general'
@@ -43,26 +70,39 @@ function App() {
   })
 
   // Friction Engine Telemetry hook
-  const { snapshot } = useFrictionEngine({
-    sessionId: 'session-live',
-    formSection: activeSection,
-    enabled: uiMode === 'complex', // monitor friction when in complex form
-    onHighCognitiveLoad: (snap) => {
-      // Auto-morph UI when friction exceeds threshold
-      triggerSimulatedRedesign(
-        `High cognitive load detected (${snap.cognitiveLoadScore}/100) on field "${snap.activeField || 'financial details'}".`,
-        snap.activeField || undefined
-      )
-    },
-  })
+ const { snapshot } = useFrictionEngine({
+  sessionId: 'session-live',
+  formSection: activeSection,
+  enabled: uiMode === 'complex',
+})
 
   const handleSubmit = (finalValues?: Record<string, string>) => {
+    const completeFormData = finalValues
+      ? mergeFlatIntoFormData(formData, finalValues)
+      : formData
+
     if (finalValues) {
-      handleValuesChange(finalValues)
+      setFormData(completeFormData)
     }
-    alert(
-      '🎉 Loan Application Successfully Submitted!\n\nAll user data was preserved and verified across UI transitions.'
-    )
+
+    if (socketStatus !== 'connected' || !socket?.connected) {
+      setSubmissionStatus('Cannot submit while the backend connection is unavailable.')
+      return
+    }
+
+    setSubmissionStatus('Submitting application…')
+    if (!emit('wizard:submit', completeFormData)) {
+      setSubmissionStatus('The application could not be sent because the connection was lost.')
+      return
+    }
+
+    if (submissionTimeoutRef.current) clearTimeout(submissionTimeoutRef.current)
+    submissionTimeoutRef.current = setTimeout(() => {
+      submissionTimeoutRef.current = null
+      setSubmissionStatus(
+        'No submission confirmation was received. The backend may have received the application; verify before retrying.'
+      )
+    }, 10000)
   }
 
   return (
@@ -147,27 +187,27 @@ function App() {
 
       {/* Main Content Area */}
       <main className="max-w-5xl mx-auto px-4 py-8">
+        {submissionStatus && (
+          <p className="mb-4 text-sm text-slate-600" role="status" aria-live="polite">
+            {submissionStatus}
+          </p>
+        )}
         {uiMode === 'simplified' ? (
-          <div>
-            {instructions ? (
-              <DynamicUIInstructionRenderer
-                instructions={instructions}
-                initialValues={flattenedValues}
-                onChange={handleValuesChange}
-                onSubmit={handleSubmit}
-                onCancel={cancelRedesign}
-              />
-            ) : (
-              <SimplifiedLoanWizard
-                initialValues={flattenedValues}
-                onChange={handleValuesChange}
-                onSubmit={handleSubmit}
-                onCancel={cancelRedesign}
-              />
-            )}
-          </div>
+          instructions ? (
+            <DynamicUIInstructionRenderer
+              instructions={instructions}
+              initialValues={flattenedValues}
+              onChange={handleValuesChange}
+              onSubmit={handleSubmit}
+              onCancel={cancelRedesign}
+            />
+          ) : (
+            <p className="text-center text-slate-500" role="status">
+              Preparing the simplified form…
+            </p>
+          )
         ) : (
-          <LoanApplicationForm {...formState} />
+          <LoanApplicationForm {...formState} onSubmit={() => handleSubmit()} />
         )}
       </main>
 

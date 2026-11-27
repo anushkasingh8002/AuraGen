@@ -16,6 +16,8 @@ All WebSocket communication between the client and server conforms to a standard
 - **`payload`** (object | array, required): Event-specific data body.
 
 Maximum allowed frame size is **64 KB** (`MAX_MESSAGE_BYTES = 64 * 1024`). Frames exceeding this size result in socket closure with code `1009` (Message Too Big).
+The server accepts only the exact origins configured in `ALLOWED_ORIGINS`.
+Each socket is limited to 100 messages per second.
 
 ---
 
@@ -129,18 +131,18 @@ Returns current form structure and flattened values.
       "title": "Comprehensive Financial Loan Application",
       "fields": [
         { "id": "firstName", "label": "First Name", "type": "text", "required": true },
-        { "id": "monthlyIncome", "label": "Monthly Net Income", "type": "number", "required": true },
-        { "id": "ssn", "label": "Social Security Number", "type": "text", "required": true, "sensitive": true }
+        { "id": "monthlyIncome", "label": "Monthly Net Income", "type": "number", "required": true }
       ]
     },
     "values": {
       "firstName": "Alice",
-      "monthlyIncome": "45000",
-      "ssn": "123-45-6789"
+      "monthlyIncome": "45000"
     }
   }
 }
 ```
+Sensitive fields such as SSN are omitted from both schema and values; they stay
+in the browser's original form state and are not included in redesign requests.
 
 #### 8. `redesign:progress` (Server $\rightarrow$ Client, Optional)
 Token generation progress (throttled to max once per 250ms).
@@ -155,7 +157,9 @@ Token generation progress (throttled to max once per 250ms).
 ```
 
 #### 9. `redesign:ready` (Server $\rightarrow$ Client)
-Delivers validated, compiled CommonJS React wizard.
+Delivers validated, compiled CommonJS component output. The browser treats
+`code` as data only and does not evaluate it; it constructs its guided UI from
+the safe form schema.
 ```json
 {
   "type": "redesign:ready",

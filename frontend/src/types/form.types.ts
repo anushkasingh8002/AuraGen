@@ -50,6 +50,7 @@ export interface FormData {
   employment: EmploymentInfo
   loan: LoanDetails
   assets: AssetsLiabilities
+  additionalFields: Record<string, string>
   agreeToTerms: boolean
   agreeToCredit: boolean
 }
@@ -73,6 +74,7 @@ export const initialFormData: FormData = {
     propertyValue: '', vehicleValue: '', creditCardDebt: '',
     studentLoanDebt: '', mortgageBalance: '', otherLiabilities: '',
   },
+  additionalFields: {},
   agreeToTerms: false,
   agreeToCredit: false,
 }

@@ -30,7 +30,7 @@ export default function CognitiveLoadIndicator({ snapshot, visible = true }: Pro
     score < 40 ? 'bg-emerald-400' : score < 65 ? 'bg-amber-400' : 'bg-red-500'
 
   return (
-    <div className="fixed bottom-4 right-4 w-72 bg-white rounded-2xl shadow-xl border border-slate-200 p-4 z-50 text-xs">
+    <div className="fixed bottom-4 right-4 w-72 bg-white rounded-2xl shadow-xl border border-slate-200 p-4 z-50 text-xs pointer-events-none">
       {/* Header */}
       <div className="flex items-center justify-between mb-3">
         <span className="font-bold text-slate-500 uppercase tracking-wide">AuraGen Debug</span>

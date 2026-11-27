@@ -40,7 +40,10 @@ const config = Object.freeze({
   PORT: int(process.env.PORT, 4000),
 
   /** Origins the WebSocket server will accept (array of strings) */
-  ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS || "http://localhost:3000")
+  ALLOWED_ORIGINS: (
+    process.env.ALLOWED_ORIGINS ||
+    "http://localhost:5173,http://127.0.0.1:5173"
+  )
     .split(",")
     .map((o) => o.trim()),
 
@@ -73,4 +76,3 @@ const config = Object.freeze({
 });
 
 export default config;
-

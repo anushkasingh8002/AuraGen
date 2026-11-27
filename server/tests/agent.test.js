@@ -8,7 +8,13 @@
 // RUN:  npm test
 // ─────────────────────────────────────────────────────────────────────
 
-import { maskValues, summarizeValuesForLlm, isFieldSensitive } from "../agent/mask.js";
+import {
+  maskValues,
+  sanitizeSchema,
+  sanitizeValues,
+  summarizeValuesForLlm,
+  isFieldSensitive,
+} from "../agent/mask.js";
 import {
   requestSnapshot,
   resolveSnapshot,
@@ -63,6 +69,58 @@ describe("maskValues", () => {
     expect(masked.creditCardNumber).toBe("[MASKED]");
     expect(masked.userPassword).toBe("[MASKED]");
     expect(masked.oneTimeOtp).toBe("[MASKED]");
+  });
+
+  describe("redesign input sanitization", () => {
+    test("removes sensitive schema fields and values before generation", () => {
+      const schema = {
+        formId: "test",
+        sections: [{
+          id: "identity",
+          fields: [
+            { id: "firstName", label: "First name", type: "text" },
+            { id: "existingDebts", label: "Existing monthly debts", type: "number" },
+            { id: "checkingBalance", label: "Checking Account Balance", type: "number" },
+            { id: "creditCardDebt", label: "Credit Card Debt", type: "number" },
+            { id: "ssn", label: "Social Security Number", type: "text" },
+            { id: "privateNote", label: "Note", type: "text", sensitive: true },
+          ],
+        }],
+        fields: [
+          { id: "firstName", label: "First name", type: "text" },
+          { id: "existingDebts", label: "Existing monthly debts", type: "number" },
+          { id: "checkingBalance", label: "Checking Account Balance", type: "number" },
+          { id: "creditCardDebt", label: "Credit Card Debt", type: "number" },
+          { id: "ssn", label: "Social Security Number", type: "text" },
+          { id: "privateNote", label: "Note", type: "text", sensitive: true },
+        ],
+        properties: {
+          firstName: { type: "string" },
+          ssn: { type: "string" },
+        },
+      };
+
+      expect(sanitizeSchema(schema).fields.map((field) => field.id)).toEqual([
+        "firstName",
+        "existingDebts",
+        "checkingBalance",
+        "creditCardDebt",
+      ]);
+      expect(sanitizeSchema(schema).sections[0].fields.map((field) => field.id))
+        .toEqual([
+          "firstName",
+          "existingDebts",
+          "checkingBalance",
+          "creditCardDebt",
+        ]);
+      expect(Object.keys(sanitizeSchema(schema).properties)).toEqual(["firstName"]);
+
+      expect(sanitizeValues(schema, {
+        firstName: "Ada",
+        ssn: "123-45-6789",
+        privateNote: "private",
+      })).toEqual({ firstName: "Ada" });
+    });
   });
 
   test("masks fields flagged sensitive: true in schema even without matching ID", () => {
